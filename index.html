@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MT5 Dashboard &amp; Chatbot</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="bg" aria-hidden="true">
+    <div class="orb orb-1"></div>
+    <div class="orb orb-2"></div>
+    <div class="orb orb-3"></div>
+  </div>
+
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">M</span>
+        <div>
+          <h1>MT5 Dashboard</h1>
+          <p class="account-label" id="accountLabel">Conectando a MetaTrader 5...</p>
+        </div>
+      </div>
+      <div class="conn">
+        <span class="dot" id="connDot"></span>
+        <span id="connText">offline</span>
+      </div>
+    </header>
+
+    <div class="layout">
+      <main class="main">
+        <section class="kpi-grid" id="kpiGrid">
+          <article class="card accent-pink">
+            <span class="card-label">Balance</span>
+            <span class="card-value" id="kpiBalance">--</span>
+            <span class="card-sub" id="kpiBalanceSub">--</span>
+          </article>
+          <article class="card accent-violet">
+            <span class="card-label">Equity</span>
+            <span class="card-value" id="kpiEquity">--</span>
+            <span class="card-sub" id="kpiEquitySub">Patrimonio disponible</span>
+          </article>
+          <article class="card accent-green">
+            <span class="card-label">Ganancia / Pérdida</span>
+            <span class="card-value" id="kpiProfit">--</span>
+            <span class="card-sub" id="kpiProfitSub">Flotante</span>
+          </article>
+          <article class="card accent-cyan">
+            <span class="card-label">Margen Libre</span>
+            <span class="card-value" id="kpiFreeMargin">--</span>
+            <span class="card-sub" id="kpiFreeMarginSub">Disponible para operar</span>
+          </article>
+          <article class="card accent-amber">
+            <span class="card-label">Nivel de Margen</span>
+            <span class="card-value" id="kpiMarginLevel">--</span>
+            <span class="card-sub" id="kpiMarginLevelSub">Margen usado: --</span>
+          </article>
+          <article class="card accent-blue">
+            <span class="card-label">Posiciones Abiertas</span>
+            <span class="card-value" id="kpiPositions">--</span>
+            <span class="card-sub" id="kpiPositionsSub">Apalancamiento: --</span>
+          </article>
+        </section>
+
+        <section class="panel chart-panel">
+          <header class="panel-head chart-head">
+            <h2>Gráfico en Vivo</h2>
+            <div class="chart-controls">
+              <input
+                id="chartSymbol"
+                class="sym-input"
+                type="text"
+                value="EURUSD"
+                placeholder="Símbolo"
+                spellcheck="false"
+              >
+              <button
+                type="button"
+                id="btnChartAssistant"
+                class="btn-chart-assist"
+                title="Analizar el gráfico con la AI Chart Assistant"
+                data-tip="Envía una captura del gráfico actual a la IA y devuelve un diagnóstico SMC con recomendación"
+              >🪄 Analizar Gráfico con IA</button>
+              <button
+                type="button"
+                id="btnSetupEval"
+                class="btn-chart-assist btn-setup-eval"
+                title="Evaluar setup determinista (sin IA): score + Entry/SL/TP"
+                data-tip="Calcula score de setup con risk_engine y dibuja bandera Entry + líneas SL/TP si el score alcanza el mínimo configurado (strategy.yaml)"
+              >⚡ Calcular Setup</button>
+              <div class="tf-group" id="tfGroup">
+                <button type="button" data-tf="M1">M1</button>
+                <button type="button" data-tf="M5">M5</button>
+                <button type="button" data-tf="M15" class="active">M15</button>
+                <button type="button" data-tf="M30">M30</button>
+                <button type="button" data-tf="H1">H1</button>
+                <button type="button" data-tf="H4">H4</button>
+                <button type="button" data-tf="D1">D1</button>
+                <button type="button" data-tf="W1">W1</button>
+              </div>
+              <button type="button" id="btnCvd" class="btn-mini" title="Mostrar/ocultar overlay de CVD (tick volume MT5)">
+                CVD
+              </button>
+              <button type="button" id="btnVp" class="btn-mini" title="Mostrar/ocultar Volume Profile de sesión [SINTÉTICO/MT5]">
+                VP
+              </button>
+              <button type="button" id="btnJournal" class="btn-mini" title="Mostrar/ocultar SL/TP de operaciones del journal">
+                Journal
+              </button>
+              <span class="chart-quote" id="chartQuote" title="Precio en vivo Bid / Ask">-- / --</span>
+              <div class="chart-trade-btns">
+                <button type="button" class="btn-buy" id="tradeBuyBtn" disabled title="Comprar (BUY) al Ask">BUY</button>
+                <button type="button" class="btn-sell" id="tradeSellBtn" disabled title="Vender (SELL) al Bid">SELL</button>
+              </div>
+              <span class="risk-chip" id="riskChip" title="Estado de riesgo diario">--</span>
+              <span class="cot-chip" id="cotBadge" hidden title="Confluencia macro COT (CFTC) del EURUSD"></span>
+              <span class="score-chip" id="scoreBadge" hidden title="Setup Score del risk engine (M1)"></span>
+              <button type="button" class="btn-mini" id="tradeCfgBtn" title="Configuración de trading (espejo EA)">⚙</button>
+            </div>
+          </header>
+          <div class="chart-box">
+            <div class="chart-msg" id="chartMsg">Cargando datos...</div>
+            <div id="drawTools" class="draw-tools" title="Herramientas de dibujo (se guardan por símbolo/timeframe)">
+              <button type="button" class="dt-btn active" data-tool="cursor" title="Seleccionar / mover dibujos. Los puntos blancos mueven los extremos.">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M5 3l14 7-6 1.5L10 17z"/>
+                </svg>
+              </button>
+              <span class="dt-sep"></span>
+              <button type="button" class="dt-btn" data-tool="line" title="Segmento de tendencia (2 clics)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M4 18L18 5"/>
+                </svg>
+              </button>
+              <button type="button" class="dt-btn" data-tool="hline" title="Nivel horizontal PDH / PDL (1 clic)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+                  <path d="M3 12h18"/>
+                  <circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/>
+                </svg>
+              </button>
+              <button type="button" class="dt-btn" data-tool="rect" title="Rectángulo / zona FVG-OB (2 clics)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="4" y="6" width="16" height="12" rx="1"/>
+                </svg>
+              </button>
+              <span class="dt-sep"></span>
+              <button type="button" class="dt-btn" data-tool="measure" title="Medición de distancia / R:R (2 clics)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+                  <path d="M4 5l16 14"/>
+                  <path d="M4 5v4M8 5v4M12 5v4M16 5v4M20 5v4"/>
+                  <path d="M4 5h4M8 19h4M12 19h4M16 19h4"/>
+                </svg>
+              </button>
+              <button type="button" class="dt-btn" data-tool="text" title="Etiqueta de texto (1 clic)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M6 6V4h12v2M12 4v16M10 20h4"/>
+                </svg>
+              </button>
+              <span class="dt-sep"></span>
+              <button type="button" class="dt-btn danger" data-tool="delete" title="Borrar un dibujo (clic sobre él)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M4 7h16M9 7V5a1 1 0 011-1h4a1 1 0 011 1v2M6 7l1 12a1 1 0 001 1h8a1 1 0 001-1l1-12M10 11v6M14 11v6"/>
+                </svg>
+              </button>
+              <button type="button" class="dt-btn danger" id="dtClear" title="Limpiar todos los dibujos de este símbolo/timeframe">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+                  <path d="M6 6l12 12M18 6L6 18"/>
+                </svg>
+              </button>
+              <span class="draw-hint" id="drawHint"></span>
+            </div>
+            <div id="chart"></div>
+          </div>
+        </section>
+
+        <section class="panel of-panel">
+          <header class="panel-head of-head">
+            <div class="of-title">
+              <h2>Order Flow · 6E</h2>
+              <span class="of-conn" id="ofConn"><span class="dot"></span><span>apagado</span></span>
+            </div>
+            <div class="panel-actions">
+              <label class="switch" title="Conectar / desconectar el feed de Databento 6E">
+                <input type="checkbox" id="feedToggle">
+                <span class="slider"></span>
+                <span class="switch-label" id="feedToggleLabel">Apagado</span>
+              </label>
+              <span class="updated" id="ofUpdated"></span>
+            </div>
+          </header>
+
+          <div class="of-kpis" id="ofKpis">
+            <article class="of-kpi">
+              <span class="of-kpi-label">CVD</span>
+              <span class="of-kpi-value" id="ofCvd">--</span>
+              <span class="of-kpi-sub" id="ofCvdSub">Delta acumulado</span>
+            </article>
+            <article class="of-kpi">
+              <span class="of-kpi-label">Delta</span>
+              <span class="of-kpi-value" id="ofDelta">--</span>
+              <span class="of-kpi-sub">Último trade</span>
+            </article>
+            <article class="of-kpi">
+              <span class="of-kpi-label">Volumen</span>
+              <span class="of-kpi-value" id="ofVol">--</span>
+              <span class="of-kpi-sub">Total acumulado</span>
+            </article>
+            <article class="of-kpi">
+              <span class="of-kpi-label">Compra / Venta</span>
+              <span class="of-kpi-value" id="ofBuySell">--</span>
+              <span class="of-kpi-sub" id="ofBuySellSub">--</span>
+            </article>
+            <article class="of-kpi">
+              <span class="of-kpi-label">Spikes</span>
+              <span class="of-kpi-value" id="ofSpikes">--</span>
+              <span class="of-kpi-sub">Z-score ≥ 2.5</span>
+            </article>
+          </div>
+
+          <div class="of-controls">
+            <label class="of-ctl">
+              <span>Z-score umbral</span>
+              <input type="range" id="ofZscore" min="1.5" max="3.5" step="0.1" value="2.5">
+              <output id="ofZscoreOut">2.5</output>
+            </label>
+            <label class="of-ctl">
+              <span>Ventana absorción (trades)</span>
+              <input type="number" id="ofAbsorbWin" min="20" max="300" step="5" value="120">
+            </label>
+          </div>
+
+          <div class="of-plot">
+            <div id="ofChart"></div>
+          </div>
+
+          <div class="of-body">
+            <div class="of-alerts">
+              <h3>Alertas de Order Flow</h3>
+              <div class="of-alerts-list" id="ofAlerts"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel news-card">
+          <header class="panel-head">
+            <h2>Calendario Económico (USD / EUR)</h2>
+          </header>
+          <div class="news-body">
+            <div class="tradingview-widget-container">
+              <div class="tradingview-widget-container__widget"></div>
+              <div class="tradingview-widget-copyright">
+                <a href="https://es.tradingview.com/" rel="noopener nofollow" target="_blank">
+                  <span class="blue-text">Calendario Económico</span>
+                </a>
+                por TradingView
+              </div>
+              <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-events.js" async>
+              {
+                "colorTheme": "dark",
+                "isTransparent": true,
+                "width": "100%",
+                "height": "400",
+                "locale": "es",
+                "importanceFilter": "0",
+                "currencyFilter": "USD,EUR"
+              }
+              </script>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <header class="panel-head">
+            <h2>Posiciones Abiertas</h2>
+            <div class="panel-actions">
+              <span class="updated" id="posUpdated"></span>
+              <button class="btn" id="refreshBtn" type="button">Actualizar</button>
+            </div>
+          </header>
+          <div class="table-wrap">
+            <table id="posTable">
+              <thead>
+                <tr>
+                  <th>Símbolo</th>
+                  <th>Tipo</th>
+                  <th>Volumen</th>
+                  <th>Precio apertura</th>
+                  <th>SL</th>
+                  <th>TP</th>
+                  <th>Precio actual</th>
+                  <th>Ganancia</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <header class="panel-head">
+            <h2>Últimas Operaciones</h2>
+            <span class="updated" id="histUpdated"></span>
+          </header>
+          <div class="table-wrap">
+            <table id="histTable">
+              <thead>
+                <tr>
+                  <th>Fecha</th>
+                  <th>Símbolo</th>
+                  <th>Tipo</th>
+                  <th>Volumen</th>
+                  <th>Entrada</th>
+                  <th>Cierre</th>
+                  <th>Comisión</th>
+                  <th>Swap</th>
+                  <th>Ganancia</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <header class="panel-head">
+            <h2>Base de Datos Local</h2>
+            <div class="panel-actions">
+              <input type="text" id="dbSearch" class="db-search" placeholder="🔍 Filtrar por clave, fecha o estado…" autocomplete="off">
+              <select id="dbLimitSelect" class="role-select" title="Nº de filas">
+                <option value="25">25 filas</option>
+                <option value="50">50 filas</option>
+                <option value="100" selected>100 filas</option>
+                <option value="200">200 filas</option>
+              </select>
+              <button class="btn" id="dbRefreshBtn" type="button">Actualizar</button>
+              <span class="updated" id="dbUpdated"></span>
+            </div>
+          </header>
+          <div class="db-tabs" id="dbTabs"></div>
+          <div class="table-wrap">
+            <table id="dbTable">
+              <thead><tr id="dbTableHead"></tr></thead>
+              <tbody id="dbTableBody"></tbody>
+            </table>
+          </div>
+        </section>
+      </main>
+
+      <aside class="chat">
+        <header class="chat-head">
+          <div>
+            <h2>MT5 Agent</h2>
+            <span class="cap">Asistente IA · datos en base local</span>
+          </div>
+          <span class="chat-ico"></span>
+        </header>
+
+        <div class="chat-controls">
+          <span class="role-chip" id="roleChip">Asistente Trading</span>
+          <button type="button" class="btn-mini" id="newConvBtn" title="Nueva conversación" data-tip="Inicia una conversación nueva y limpia el historial visible">+</button>
+        </div>
+
+        <div class="suggestions" id="suggestions">
+          <button type="button" class="chip" data-q="¿Cuál es mi saldo, equity y margen?" data-tip="Consulta saldo, equity, margen y capital libre desde tu MT5">Mi cuenta</button>
+          <button type="button" class="chip" data-q="analiza el order flow del 6E y dime si hay absorción o picos relevantes" data-tip="Analiza el flujo de órdenes del 6E en vivo (absorción, picos, imbalances)">Order flow 6E</button>
+          <button type="button" class="chip" data-q="lista mis últimas operaciones cerradas" data-tip="Lista tus operaciones cerradas más recientes desde el historial">Historial</button>
+          <button type="button" class="chip" data-q="¿tengo posiciones abiertas?" data-tip="Muestra si tienes posiciones abiertas ahora mismo">Posiciones</button>
+          <button type="button" class="chip" data-q="uso la herramienta economic_news y dime cuál fue la última noticia del día y cuál será la próxima relevante para el EUR/USD, con su hora y nivel de impacto" data-tip="Consulta el calendario económico y te dice la última y la próxima noticia del día para EUR/USD">Noticias EUR/USD</button>
+        </div>
+
+        <div class="chat-messages" id="chatMessages"></div>
+
+        <form class="chat-input" id="chatForm">
+          <input
+            id="chatText"
+            type="text"
+            placeholder='Ej: "analiza el order flow del 6E"'
+            autocomplete="off"
+          >
+          <button type="submit" id="chatSend">Enviar</button>
+        </form>
+      </aside>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="roleModal" hidden>
+    <div class="modal">
+      <header class="modal-head">
+        <h3>Editar rol del agente</h3>
+        <button type="button" class="btn-mini" id="roleClose" title="Cerrar">✕</button>
+      </header>
+      <div class="modal-body">
+        <div class="rv">
+          <label>Nombre del rol</label>
+          <input id="roleName" type="text" placeholder="Ej: Analista 6E / Order Flow">
+        </div>
+        <div class="rv">
+          <label>Proveedor</label>
+          <select id="roleProvider">
+            <option value="auto">Auto (fallback GPT → Gemini → Claude)</option>
+            <option value="openai">OpenAI</option>
+            <option value="gemini">Gemini</option>
+            <option value="anthropic">Anthropic (Claude)</option>
+          </select>
+        </div>
+        <div class="rv">
+          <label>Modelo (vacío = usar auto)</label>
+          <input id="roleModel" type="text" placeholder="Ej: gpt-4o-mini, gemini-2.0-flash">
+        </div>
+        <div class="rv">
+          <label>Prompt del sistema (rol)</label>
+          <textarea id="rolePrompt" rows="6" placeholder="Define cómo se comporta el agente..."></textarea>
+        </div>
+        <div class="rv">
+          <label>Herramientas permitidas</label>
+          <div class="role-tools" id="roleTools"></div>
+        </div>
+      </div>
+      <footer class="modal-foot">
+        <button type="button" class="btn" id="roleSave">Guardar rol</button>
+      </footer>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="tradeModal" hidden>
+    <div class="modal">
+      <header class="modal-head">
+        <h3 id="tradeModalTitle">Confirmar orden</h3>
+        <button type="button" class="btn-mini" id="tradeClose" title="Cerrar">✕</button>
+      </header>
+      <div class="modal-body trade-summary">
+        <div class="rv rv-row"><label>Tipo de orden</label><span id="tmType"></span></div>
+        <div class="rv rv-row"><label>Símbolo</label><span id="tmSymbol" class="symbol"></span></div>
+        <div class="rv rv-row"><label>Dirección</label><span id="tmAction" class="tradetype"></span></div>
+        <div class="rv rv-row"><label>Precio de entrada</label><span id="tmEntry"></span></div>
+        <div class="rv"><label>Volumen (lote)</label><input id="tmVolume" type="number" step="0.01" min="0.01"></div>
+        <div class="rv"><label>SL (pips)</label><input id="tmSl" type="number" step="1" min="0"></div>
+        <div class="rv"><label>TP (pips, 0 = sin TP)</label><input id="tmTp" type="number" step="1" min="0"></div>
+        <div class="rv rv-row"><label>Riesgo estimado</label><span id="tmRisk" class="profit-neg"></span></div>
+        <div class="rv rv-row"><label>Margen necesario</label><span id="tmMargin"></span></div>
+        <div class="rv rv-row"><label>Magic / Comment</label><span id="tmMeta"></span></div>
+        <div class="rv rv-row"><label>Filling</label><span id="tmFill"></span></div>
+        <p class="trade-note" id="tmNote"></p>
+      </div>
+      <footer class="modal-foot">
+        <button type="button" class="btn btn-confirm" id="tradeConfirm">Confirmar</button>
+      </footer>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="tradeConfigModal" hidden>
+    <div class="modal">
+      <header class="modal-head">
+        <h3>Configuración de trading (espejo EA)</h3>
+        <button type="button" class="btn-mini" id="tradeCfgClose" title="Cerrar">✕</button>
+      </header>
+      <div class="modal-body">
+        <div class="strategy-block">
+          <h4>Reglas activas (strategy.yaml)</h4>
+          <div id="strategyRules" class="strategy-rules">Cargando…</div>
+        </div>
+        <div class="strategy-block">
+          <h4>Watcher (bot a la escucha) <span class="muted" id="watcherStatusDot">…</span></h4>
+          <div id="watcherAgent" class="strategy-rules">Cargando…</div>
+          <div class="rv">
+            <label>Auto-ejecutar setups detectados</label>
+            <input id="tcAutoExec" type="checkbox">
+          </div>
+          <div class="rv">
+            <button type="button" class="btn" id="watcherScan">Escanear ahora</button>
+          </div>
+        </div>
+        <div class="rv">
+          <label>Magic Number (que usa tu EA)</label>
+          <input id="tcMagic" type="number" value="8882026">
+        </div>
+        <div class="rv">
+          <label>Comment de las órdenes</label>
+          <input id="tcComment" type="text" value="Web Exec">
+        </div>
+        <div class="rv">
+          <label>Riesgo por operación (%)</label>
+          <input id="tcRisk" type="number" step="0.1" min="0.1" max="5" value="0.5">
+        </div>
+        <div class="rv">
+          <label>Pérdida diaria máxima ($)</label>
+          <input id="tcLossFixed" type="number" step="50" min="0" value="1250">
+        </div>
+        <div class="rv">
+          <label>Pérdida diaria máxima (% sobre balance)</label>
+          <input id="tcLossPct" type="number" step="0.5" min="0" value="2">
+        </div>
+        <div class="rv">
+          <label>Operaciones máximas por día</label>
+          <input id="tcMaxTrades" type="number" min="0" value="10">
+        </div>
+        <div class="rv">
+          <label>SL por defecto (pips)</label>
+          <input id="tcSlPips" type="number" step="1" min="1" value="15">
+        </div>
+        <div class="rv">
+          <label>TP en múltiplos de R</label>
+          <input id="tcTpR" type="number" step="0.5" min="0" value="2">
+        </div>
+        <div class="rv">
+          <label>Desviación (puntos)</label>
+          <input id="tcDeviation" type="number" min="0" value="20">
+        </div>
+        <div class="rv">
+          <label>Símbolos permitidos (vacío = todos)</label>
+          <input id="tcAllow" type="text" placeholder="EURUSD, XAUUSD, NAS100...">
+        </div>
+      </div>
+      <footer class="modal-foot">
+        <button type="button" class="btn" id="tradeCfgSave">Guardar configuración</button>
+      </footer>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="closeModal" hidden>
+    <div class="modal modal-sm">
+      <header class="modal-head">
+        <h3>Cerrar posición</h3>
+        <button type="button" class="btn-mini" id="closeCancel" title="Cerrar">✕</button>
+      </header>
+      <div class="modal-body">
+        <p id="closeInfo" class="close-info"></p>
+        <p class="trade-note">La posición se cerrará al precio de mercado actual (mark-to-market del EA intacto).</p>
+      </div>
+      <footer class="modal-foot">
+        <button type="button" class="btn btn-danger" id="closeConfirm">Cerrar posición</button>
+      </footer>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="jsonModal" hidden>
+    <div class="modal">
+      <header class="modal-head">
+        <h3 id="jsonModalTitle">Valor JSON</h3>
+        <button type="button" class="btn-mini" id="jsonClose" title="Cerrar">✕</button>
+      </header>
+      <div class="modal-body">
+        <pre id="jsonPretty" class="json-pretty"></pre>
+      </div>
+      <footer class="modal-foot">
+        <button type="button" class="btn" id="jsonCopy">Copiar</button>
+      </footer>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+
+<script src="/static/echarts.min.js"></script>
+<script src="/static/tools.js?v=8"></script>
+  <script src="/static/main.js?v=19"></script>
+</body>
+</html>

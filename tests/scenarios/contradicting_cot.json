@@ -1,0 +1,46 @@
+{
+  "name": "COT Contradictorio: SMC Fuerte pero Macro en Contra",
+  "description": "BUY en killzone con FVG+OB+Sweep (SMC fuerte) pero COT bearish (macro en contra). Score deprimido por COT.",
+  "direction": "BUY",
+  "now_utc": "2026-09-07T14:15:00Z",
+  "symbol": "EURUSD",
+  "timeframe": "M15",
+  "killzones": [
+    {"name": "Londres", "start": "08:00", "end": "11:00"},
+    {"name": "Nueva York", "start": "13:00", "end": "16:00"}
+  ],
+  "cot": {"macro_bias": "BEARISH", "cot_index_26w": 18.5},
+  "cvd": [
+    {"time":1000000,"value":12.0},{"time":1000900,"value":27.0},
+    {"time":1001800,"value":45.0},{"time":1002700,"value":57.0},
+    {"time":1003600,"value":72.0},{"time":1004500,"value":90.0},
+    {"time":1005400,"value":102.0},{"time":1006300,"value":117.0},
+    {"time":1007200,"value":135.0},{"time":1008100,"value":147.0},
+    {"time":1009000,"value":162.0},{"time":1009900,"value":180.0},
+    {"time":1010800,"value":192.0},{"time":1011700,"value":207.0},
+    {"time":1012600,"value":225.0},{"time":1013500,"value":237.0},
+    {"time":1014400,"value":252.0},{"time":1015300,"value":270.0},
+    {"time":1016200,"value":282.0},{"time":1017100,"value":297.0}
+  ],
+  "candle_params": {"base_price": 1.1015, "count": 20, "bias": "bullish"},
+  "patterns": {
+    "fvgs": [
+      {"type": "BULLISH_FVG", "top": 1.1050, "bottom": 1.1030, "start_time": 1002700}
+    ],
+    "order_blocks": [
+      {"type": "BULLISH_OB", "top": 1.1035, "bottom": 1.1020, "start_time": 1001800}
+    ],
+    "sweeps": [
+      {"type": "PDL_SWEEP", "time": 1003600}
+    ]
+  },
+  "current_price": 1.1040,
+  "cfg": {"sl_default_pips": 15, "tp_ratio_r": 2.0, "min_rr": 2.0, "setup_ttl_minutes": 45},
+  "expected": {
+    "score_max": 79.9,
+    "verdict": "MEDIA_PROBABILIDAD",
+    "killzone_active": true,
+    "cot_value_max": 0.20,
+    "approved": false
+  }
+}

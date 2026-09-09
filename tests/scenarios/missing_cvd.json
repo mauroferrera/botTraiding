@@ -1,0 +1,36 @@
+{
+  "name": "Missing CVD: Sin Datos de Order Flow",
+  "description": "BUY en killzone con COT y SMC fuertes pero sin datos CVD. El componente CVD debe valer 0.",
+  "direction": "BUY",
+  "now_utc": "2026-09-07T14:15:00Z",
+  "symbol": "EURUSD",
+  "timeframe": "M15",
+  "killzones": [
+    {"name": "Londres", "start": "08:00", "end": "11:00"},
+    {"name": "Nueva York", "start": "13:00", "end": "16:00"}
+  ],
+  "cot": {"macro_bias": "BULLISH", "cot_index_26w": 80.0},
+  "cvd": null,
+  "candle_params": {"base_price": 1.1015, "count": 20, "bias": "bullish"},
+  "patterns": {
+    "fvgs": [
+      {"type": "BULLISH_FVG", "top": 1.1050, "bottom": 1.1030, "start_time": 1002700}
+    ],
+    "order_blocks": [
+      {"type": "BULLISH_OB", "top": 1.1035, "bottom": 1.1020, "start_time": 1001800}
+    ],
+    "sweeps": [
+      {"type": "PDL_SWEEP", "time": 1003600}
+    ]
+  },
+  "current_price": 1.1040,
+  "cfg": {"sl_default_pips": 15, "tp_ratio_r": 2.0, "min_rr": 2.0, "setup_ttl_minutes": 45},
+  "expected": {
+    "score_min": 60.0,
+    "score_max": 82.0,
+    "verdict": "MEDIA_PROBABILIDAD",
+    "killzone_active": true,
+    "cvd_value": 0.0,
+    "approved": false
+  }
+}

@@ -1,0 +1,51 @@
+risk:
+  risk_pct: 0.5
+  reduced_risk_pct: 0.25
+  loss_limit_fixed: 400.0
+  loss_limit_pct: 1.6
+  max_trades_day: 3
+execution:
+  magic: 8882026
+  comment: "ILOF Exec"
+  sl_default_pips: 12.0
+  tp_ratio_r: 2.0
+  deviation_points: 15
+  news_buffer_min: 15
+  symbols_allow: []
+score:
+  min_score: 70.0
+  min_rr: 2.0
+  setup_ttl_minutes: 20
+  weights:
+    cot: 0.0
+    cvd_of: 20.0
+    smc: 50.0
+    killzone: 30.0
+killzones:
+- name: Londres
+  start: 07:00
+  end: '10:00'
+- name: Nueva York
+  start: '12:30'
+  end: '15:30'
+prop:
+  enabled: true
+  max_dd_daily_pct: 2.0
+  max_dd_total_pct: 6.0
+  max_profit_day_pct: 1.5
+  consistency_days: 4
+data_sources:
+  cot: true
+  cvd_of: true
+  smc: true
+  killzone: true
+  news: true
+  orderflow: false
+watcher:
+  enabled: true
+  scan_interval_sec: 30
+  auto_execute: false
+  dedup_ttl_sec: 900
+  symbols:
+  - symbol: EURUSD
+    timeframe: M15

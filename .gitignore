@@ -1,0 +1,31 @@
+# Secrets / entorno local
+.env
+.env.*
+!.env.example
+
+# Base de datos y artefactos locales
+trading.db
+trading.db-*
+mt5_status.json
+
+# Logs
+*.log
+server.log
+server_out.log
+server_err.log
+dt_server.log
+
+# Cachés de Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# IDE / SO
+.idea/
+.vscode/
+Thumbs.db
+
+# Artefactos del watcher / runtime
+*.tmp
