@@ -174,6 +174,74 @@ def test_decide_transition_matrix():
     closed_row = {**active_row(), "status": "closed"}
     assert watcher.decide_transition(closed_row, True, now=NOW) == "active"
     assert watcher.decide_transition(closed_row, False, now=NOW) is None
+    # Ignorado por noticia: dedup silencioso mientras vive, cierre al morir
+    news_row = {**active_row(), "status": "news_ignored"}
+    assert watcher.decide_transition(news_row, True, now=NOW) is None
+    assert watcher.decide_transition(news_row, False, now=NOW) == "closed"
+
+
+def blocked_news_gate(reason="Nonfarm Payrolls en curso"):
+    return {"ok": False, "reason": reason,
+            "event": {"title": "Nonfarm Payrolls", "impact": "red"}}
+
+
+def test_scan_once_news_blackout_ignora_y_hace_dedup():
+    fake = FakeStoreIO()
+    logs = []
+    io = fake.io()
+    io["news_gate"] = lambda: blocked_news_gate()
+    io["log_setup"] = lambda entry: logs.append(entry)
+    msgs, broadcast = make_broadcaster()
+    calls = []
+
+    def executor(*args, **kwargs):
+        calls.append(1)
+
+    events = watcher.scan_once(
+        snapshot_builder=lambda s, tf: approved_snapshot(),
+        executor=executor, broadcast=broadcast, now=NOW, io=io,
+    )
+    ig = [e for e in events if e["event"] == "ignored_news"]
+    assert len(ig) == 1
+    assert ig[0]["direction"] == "BUY"
+    assert "Nonfarm" in ig[0]["reason"]
+    # Sin ejecución ni alerta de setup normal
+    assert calls == []
+    assert not [e for e in events if e["event"] == "new"]
+    assert not [e for e in events if e["event"] == "executed"]
+    # Registro inmutable en setup_log
+    assert len(logs) == 1
+    assert logs[0]["verdict"] == "IGNORED_NEWS"
+    assert logs[0]["validated"] is False
+    assert logs[0]["reject_reasons"][0].startswith("BLOCKED_BY_NEWS_GATE:")
+    # Estado del watcher marcado para dedup
+    assert fake._row("EURUSD", "M15")["status"] == "news_ignored"
+
+    # Segundo ciclo durante la misma ventana: sin re-log ni re-evento
+    events2 = watcher.scan_once(
+        snapshot_builder=lambda s, tf: approved_snapshot(),
+        executor=executor, broadcast=broadcast, now=NOW, io=io,
+    )
+    assert not [e for e in events2 if e["event"] == "ignored_news"]
+    assert len(logs) == 1
+    assert calls == []
+
+
+def test_scan_once_news_blackout_se_cierra_al_morir_la_senal():
+    fake = FakeStoreIO()
+    io = fake.io()
+    io["news_gate"] = lambda: blocked_news_gate()
+    fake._new("EURUSD", "M15", gate={"direction": "BUY", "score": 90.0,
+               "entry": 1.1020, "sl": 1.1005, "tp": 1.1050}, status="news_ignored")
+    msgs, broadcast = make_broadcaster()
+    events = watcher.scan_once(
+        snapshot_builder=lambda s, tf: rejected_snapshot(),
+        broadcast=broadcast, now=NOW, io=io,
+    )
+    closed = [e for e in events if e["event"] == "closed"]
+    assert len(closed) == 1
+    assert fake._row("EURUSD", "M15")["status"] == "closed"
+    assert len([m for m in msgs if m["type"] == "closed"]) == 1
 
 
 # ---------------------------------------------------------------------------

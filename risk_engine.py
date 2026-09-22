@@ -20,6 +20,7 @@ DEFAULT_WEIGHTS: Dict[str, float] = {
     "cvd_of": 25.0,
     "smc": 30.0,
     "killzone": 20.0,
+    "smr_dxy": 0.0,
 }
 
 DEFAULT_GRADE_THRESHOLDS: Dict[str, float] = {
@@ -268,11 +269,40 @@ def invalidation_level(patterns: Optional[Dict[str, Any]], direction: str) -> Op
     return max(highs) if highs else None
 
 
+def smr_component(smr: Optional[Dict[str, Any]], direction: str) -> Dict[str, Any]:
+    """Confluencia SMA/SMR via divergencia con el DXY.
+
+    `smr` viene de smr_service.evaluate() con claves "bull"/"bear". Solo la
+    divergencia confirmada aporta valor (1.0); sin divergencia o sin feed el
+    componente es neutro (0.0) — nunca penaliza el score por falta de dato,
+    que es el contrato explicito del bono (sumar solo si se confirma).
+    """
+    side = "bull" if str(direction).upper() == "BUY" else "bear"
+    info = (smr or {}).get(side) or {}
+    if info.get("confirmed"):
+        return {
+            "value": 1.0,
+            "confirmed": True,
+            "detail": f"Divergencia SMR {side} confirmada: {info.get('detail') or 'con DXY'}.",
+        }
+    if smr:
+        return {
+            "value": 0.0,
+            "confirmed": False,
+            "detail": info.get("detail") or "Sin divergencia SMR (neutro).",
+        }
+    return {
+        "value": 0.0,
+        "confirmed": False,
+        "detail": "Sin lectura SMR/DXY (neutro).",
+    }
+
+
 def setup_score(inputs: Dict[str, Any],
                 weights: Optional[Dict[str, float]] = None,
                 killzones: Optional[List[Dict[str, str]]] = None,
                 now: Optional[datetime] = None) -> Dict[str, Any]:
-    """Setup Score 0-100 con breakdown de los 4 componentes.
+    """Setup Score 0-100 con breakdown de los componentes.
 
     inputs:
       direction  ("BUY"/"SELL")
@@ -280,8 +310,9 @@ def setup_score(inputs: Dict[str, Any],
       cvd        serie CVD o None
       patterns   {"fvgs","order_blocks","sweeps",...} o None
       candles    velas OHLC o None
-    weights: {"cot","cvd_of","smc","killzone"} en puntos; si no suman 100 se
-    normalizan al total efectivo.
+      smr        resultado de smr_service.evaluate() o None
+    weights: {"cot","cvd_of","smc","killzone","smr_dxy"} en puntos; si no suman
+    100 se normalizan al total efectivo.
     """
     w = dict(DEFAULT_WEIGHTS)
     if weights:
@@ -293,6 +324,7 @@ def setup_score(inputs: Dict[str, Any],
     cot = cot_component(inputs.get("cot"), direction)
     cvd = cvd_component(inputs.get("cvd"), direction)
     smc = smc_component(inputs.get("patterns"), direction)
+    smr = smr_component(inputs.get("smr"), direction)
 
     comps = {
         "cot": {**cot, "weight": w["cot"]},
@@ -301,6 +333,7 @@ def setup_score(inputs: Dict[str, Any],
         "killzone": {"value": kz["value"], "weight": w["killzone"],
                      "detail": kz["detail"], "in_killzone": kz["in_killzone"],
                      "name": kz["name"]},
+        "smr_dxy": {**smr, "weight": w["smr_dxy"]},
     }
     score = sum(c["value"] * c["weight"] for c in comps.values()) / total_w * 100.0
 

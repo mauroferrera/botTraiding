@@ -59,7 +59,7 @@ _DEFAULTS: Dict[str, Any] = {
     "min_score": 80.0,
     "min_rr": 2.0,
     "setup_ttl_minutes": 45,
-    "risk_weights": {"cot": 25.0, "cvd_of": 25.0, "smc": 30.0, "killzone": 20.0},
+    "risk_weights": {"cot": 25.0, "cvd_of": 25.0, "smc": 30.0, "killzone": 20.0, "smr_dxy": 0.0},
     "grade_thresholds": {"alta": 80.0, "media": 60.0},
     # Killzones
     "killzones": [
@@ -80,6 +80,7 @@ _DEFAULTS: Dict[str, Any] = {
         "killzone": True,
         "news": True,
         "orderflow": False,
+        "smr_dxy": True,
     },
     # Watcher (bot a la escucha)
     "watcher_config": {
@@ -211,7 +212,7 @@ def _parse_weights(raw: Any, key: str = "score.weights") -> Dict[str, float]:
     if not isinstance(raw, dict):
         raise ValueError(f"strategy.yaml: '{key}' debe ser un objeto de pesos.")
     base = dict(_DEFAULTS["risk_weights"])
-    for k in ("cot", "cvd_of", "smc", "killzone"):
+    for k in ("cot", "cvd_of", "smc", "killzone", "smr_dxy"):
         if k in raw:
             v = raw[k]
             if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:

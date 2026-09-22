@@ -28,6 +28,11 @@ const els = {
   btnChartAssistant: document.getElementById("btnChartAssistant"),
   btnSetupEval: document.getElementById("btnSetupEval"),
   tfGroup: document.getElementById("tfGroup"),
+  chartMode: document.getElementById("chartMode"),
+  sourceChip: document.getElementById("sourceChip"),
+  evControls: document.getElementById("evControls"),
+  evMode: document.getElementById("evMode"),
+  evParam: document.getElementById("evParam"),
   chartMsg: document.getElementById("chartMsg"),
   chartQuote: document.getElementById("chartQuote"),
   btnCvd: document.getElementById("btnCvd"),
@@ -78,6 +83,35 @@ const els = {
   closeConfirm: document.getElementById("closeConfirm"),
   closeInfo: document.getElementById("closeInfo"),
   toast: document.getElementById("toast"),
+  resSymbol: document.getElementById("resSymbol"),
+  resTf: document.getElementById("resTf"),
+  resDays: document.getElementById("resDays"),
+  resExportBtn: document.getElementById("resExportBtn"),
+  resValidateBtn: document.getElementById("resValidateBtn"),
+  resBacktestBtn: document.getElementById("resBacktestBtn"),
+  resCalibrateBtn: document.getElementById("resCalibrateBtn"),
+  resSearchBtn: document.getElementById("resSearchBtn"),
+  resExplainBtn: document.getElementById("resExplainBtn"),
+  resSearch: document.getElementById("resSearch"),
+  resStatus: document.getElementById("resStatus"),
+  resResults: document.getElementById("resResults"),
+  resKpis: document.getElementById("resKpis"),
+  resChart: document.getElementById("resChart"),
+  resSuggestions: document.getElementById("resSuggestions"),
+  resBreakdown: document.getElementById("resBreakdown"),
+  resTradesBody: document.getElementById("resTradesBody"),
+  resPlotTitle: document.getElementById("resPlotTitle"),
+  auditBanner: document.getElementById("auditBanner"),
+  auditTitle: document.getElementById("auditTitle"),
+  auditPlan: document.getElementById("auditPlan"),
+  auditExitBtn: document.getElementById("auditExit"),
+  applyModal: document.getElementById("applyModal"),
+  applyClose: document.getElementById("applyClose"),
+  applyCancel: document.getElementById("applyCancel"),
+  applyConfirm: document.getElementById("applyConfirm"),
+  applyList: document.getElementById("applyList"),
+  applyResult: document.getElementById("applyResult"),
+  applyBackupNote: document.getElementById("applyBackupNote"),
 };
 
 const money = (value, currency = "$") => {
@@ -509,6 +543,53 @@ let vpData = null; // {profile, poc, vah, val, source}
 let vpSortedRows = []; // profile ordenado por precio, para lookup de color
 let vpVisible = false;
 const chartState = { tf: "M15", symbol: "EURUSD", lastBid: null };
+chartState.mode = "classic"; // classic | footprint | heatmap | vp | event
+chartState.fpData = null; // footprint payload (sintético)
+chartState.hmData = null; // heatmap payload (sintético)
+chartState.hmMaxV = 1; // valor máximo de intensidad → escala de color del heatmap
+chartState.hmPriceStep = 0; // paso de precio del ladder → alto de celda vertical
+chartState.eventBars = null; // velas por evento (sintéticas)
+
+// Fixtures de test (mode=test del backend) para footprint/heatmap: sirven datos
+// de control SIN depender de MT5. Se activan con la URL `?mode=test` o con el
+// botón del mensaje de error cuando Market Watch no tiene el símbolo.
+let fixtureMode = new URLSearchParams(window.location.search).get("mode") === "test";
+
+// Marca si el chart tiene la opción de un modo derivado (un solo grid). Cuando
+// se vuelve a classic/vp hay que restaurar baseChartOption() o los ejes quedan
+// desalineados (timestamps y volumen crudos sobre el eje de precio).
+let chartOptionIsDerived = false;
+
+const MODE_SOURCE = {
+  classic: "fuente: MT5",
+  footprint: "fuente: SINTÉTICO MT5",
+  heatmap: "fuente: SINTÉTICO MT5",
+  vp: "fuente: MT5",
+  event: "fuente: SINTÉTICO MT5",
+};
+
+// Refresco debounced de los modos derivados cuando llega una vela nueva.
+let derivedRefreshTimer = null;
+let eventRefreshTimer = null;
+function scheduleDerivedRefresh() {
+  if (chartState.mode === "event") {
+    scheduleEventRefresh();
+    return;
+  }
+  if (derivedRefreshTimer) clearTimeout(derivedRefreshTimer);
+  derivedRefreshTimer = setTimeout(() => {
+    derivedRefreshTimer = null;
+    if (chartState.mode === "footprint") loadFootprint();
+    else if (chartState.mode === "heatmap") loadHeatmap();
+  }, 4000);
+}
+function scheduleEventRefresh() {
+  if (eventRefreshTimer) clearTimeout(eventRefreshTimer);
+  eventRefreshTimer = setTimeout(() => {
+    eventRefreshTimer = null;
+    loadEventBars();
+  }, 3000);
+}
 const chartIndexMap = new Map(); // time -> índice en lastCandles
 
 const PATTERN_TFS = ["M1", "M5", "M15", "M30", "H1", "H4"];
@@ -516,6 +597,17 @@ let patternBusy = false;
 let cvdOverlayOn = false;
 let journalOverlay = []; // líneas de SL/TP del journal para el símbolo activo
 let journalOverlayOn = false;
+
+// Capas de chartismo activas por botón (toggle). Los botones mapean a los
+// grupos que detecta chartism_engine.py (trend/triangle/flag/double/hns).
+const CHARTISM_GROUPS = {
+  trend: "Canal/Tendencia",
+  triangle: "Triángulo",
+  flag: "Bandera",
+  double: "Doble techo/suelo",
+  hns: "Cabeza y hombros",
+};
+const chartismLayers = new Set();
 
 const CVD_AXIS_KEY = "cvd_overlay_axis";
 
@@ -529,9 +621,24 @@ const CHART_COLORS = {
   cvdBottom: "#ff5d6c",
 };
 
-function chartMsg(text) {
-  els.chartMsg.textContent = text || "";
+function chartMsg(text, action) {
+  if (!els.chartMsg) return;
   els.chartMsg.classList.toggle("hidden", !text);
+  els.chartMsg.textContent = text || "";
+  if (text && action && els.chartMsg.querySelector(".chart-msg-btn") === null) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "chart-msg-btn";
+    btn.textContent = action.label;
+    btn.addEventListener("click", action.handler);
+    els.chartMsg.appendChild(btn);
+  }
+}
+
+// Activa los fixtures de test (mode=test) y recarga el modo derivado actual.
+function enableFixtureMode() {
+  fixtureMode = true;
+  setChartMode(chartState.mode);
 }
 
 const pad2 = (x) => String(x).padStart(2, "0");
@@ -557,11 +664,24 @@ function chartNiceTime(t) {
   return `${d.toISOString().slice(0, 10)} ${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`;
 }
 
+function eventBarLabel(value, index) {
+  // Event Bars (volbar/tickbar/renko): el eje X es de CATEGORÍA indexado por
+  // barra de evento, no por reloj. La etiqueta muestra el número de orden de la
+  // barra (distancia equidistante) en lugar de horas fijas (00:00, 05:00...).
+  // El timestamp real queda disponible en el tooltip vía chartTooltip.
+  if (chartState.mode !== "event") return chartTimeLabel(value);
+  return String(index);
+}
+
 function chartTooltip(params) {
   const arr = Array.isArray(params) ? params : [params];
   const candle = arr.find((p) => p.seriesType === "candlestick");
   if (candle) {
-    const c = lastCandles[candle.dataIndex];
+    const barData =
+      chartState.mode === "event" && chartState.eventBars && chartState.eventBars.length
+        ? chartState.eventBars
+        : lastCandles;
+    const c = barData[candle.dataIndex];
     const datum = candle.data;
     const digits = datum[1] < 100 ? 5 : 2;
     const fmt = (v) => (v === undefined || v === null ? "—" : Number(v).toFixed(digits));
@@ -783,7 +903,11 @@ function baseChartOption() {
         itemStyle: {
           color: (p) => {
             const idx = p.data?.[1] ?? 0;
-            const price = vpSortedRows[idx]?.price ?? 0;
+            const row = vpSortedRows[idx];
+            const price = row?.price ?? 0;
+            if (row && row.delta !== undefined && Math.abs(row.delta) > 0.0001) {
+              return row.delta >= 0 ? "rgba(46,230,168,0.45)" : "rgba(255,93,108,0.45)";
+            }
             return vpData && price >= vpData.val && price <= vpData.vah
               ? "rgba(138,108,255,0.65)"
               : "rgba(138,108,255,0.22)";
@@ -797,10 +921,526 @@ function baseChartOption() {
   };
 }
 
+/* ============================================================
+   Modos de gráfico (selector #chartMode)
+   classic | footprint | heatmap | vp | event
+   ============================================================ */
+
+function buildDerivedBaseOption(dmode) {
+  // Base para footprint / heatmap / event: un solo grid de precio a todo lo ancho.
+  const customSeries =
+    dmode === "footprint"
+      ? {
+          id: "footprint",
+          name: "Footprint",
+          type: "custom",
+          xAxisIndex: 0,
+          yAxisIndex: 0,
+          data: [],
+          clip: true,
+          z: 3,
+          renderItem: footprintRenderItem,
+        }
+      : {
+          id: "heatmap",
+          name: "Liquidez",
+          type: "custom",
+          xAxisIndex: 0,
+          yAxisIndex: 0,
+          data: [],
+          clip: true,
+          silent: true,
+          z: 1,
+          renderItem: heatmapRenderItem,
+        };
+  const opt = {
+    animation: false,
+    backgroundColor: "transparent",
+    textStyle: { color: CHART_COLORS.text, fontFamily: "'DM Sans', sans-serif", fontSize: 12 },
+    tooltip: {
+      trigger: dmode === "footprint" ? "item" : "axis",
+      axisPointer: {
+        type: "cross",
+        lineStyle: { color: "rgba(255,255,255,0.2)" },
+        label: { backgroundColor: "#1d2333", color: "#e6e9f2" },
+      },
+      backgroundColor: "rgba(13,17,28,0.92)",
+      borderColor: CHART_COLORS.border,
+      textStyle: { color: "#e6e9f2", fontSize: 12 },
+      formatter: dmode === "footprint" ? footprintTooltip : chartTooltip,
+    },
+    grid: [{ left: 64, right: 14, top: 6, height: "76%", containLabel: false }],
+    xAxis: [
+      {
+        type: "category",
+        gridIndex: 0,
+        data: [],
+        boundaryGap: true,
+        axisLine: { lineStyle: { color: CHART_COLORS.border } },
+        axisTick: { show: false },
+        axisLabel: { color: CHART_COLORS.text, fontSize: 11, formatter: chartTimeLabel },
+        splitLine: { show: false },
+      },
+    ],
+    yAxis: [
+      {
+        type: "value",
+        scale: true,
+        gridIndex: 0,
+        position: "right",
+        splitLine: { lineStyle: { color: CHART_COLORS.grid } },
+        axisLabel: {
+          color: CHART_COLORS.text,
+          fontSize: 11,
+          formatter: (value) => Number(value).toFixed(5),
+        },
+        axisLine: { show: false },
+        axisTick: { show: false },
+      },
+    ],
+    dataZoom: [
+      { type: "inside", xAxisIndex: 0, start: 0, end: 100 },
+      {
+        type: "slider",
+        xAxisIndex: 0,
+        height: 14,
+        bottom: 0,
+        borderColor: CHART_COLORS.border,
+        backgroundColor: "rgba(255,255,255,0.02)",
+        fillerColor: "rgba(138,108,255,0.12)",
+        dataBackground: {
+          lineStyle: { color: CHART_COLORS.text, opacity: 0.35 },
+          areaStyle: { color: "rgba(255,255,255,0.05)" },
+        },
+        selectedDataBackground: {
+          lineStyle: { color: CHART_COLORS.cvdTop },
+          areaStyle: { color: "rgba(138,108,255,0.15)" },
+        },
+        handleStyle: { color: CHART_COLORS.cvdTop },
+        textStyle: { color: CHART_COLORS.text, fontSize: 10 },
+      },
+    ],
+    series: [
+      {
+        id: "candles",
+        name: "Precio",
+        type: "candlestick",
+        xAxisIndex: 0,
+        yAxisIndex: 0,
+        data: [],
+        barWidth: dmode === "footprint" ? 5 : 7,
+        z: dmode === "footprint" ? 4 : 3,
+        itemStyle: {
+          color: CHART_COLORS.up,
+          color0: CHART_COLORS.down,
+          borderColor: CHART_COLORS.up,
+          borderColor0: CHART_COLORS.down,
+          opacity: dmode === "heatmap" ? 0.9 : 0.85,
+        },
+        markArea: { silent: true, label: { show: false }, data: [] },
+        markLine: { silent: true, symbol: "none", data: [] },
+        markPoint: { silent: true, data: [] },
+      },
+      customSeries,
+    ],
+  };
+  return opt;
+}
+
+function buildEventBarsOption() {
+  const opt = buildDerivedBaseOption("event");
+  opt.series.pop(); // quita la serie derivada; solo velas por evento
+  opt.tooltip.trigger = "axis";
+  opt.tooltip.formatter = chartTooltip;
+  opt.xAxis[0].axisLabel.formatter = eventBarLabel;
+  // Velas ancho relativo: ocupan todo el ancho del contenedor sin huecos
+  // laterales, aunque la API devuelva pocas barras de eventos.
+  opt.series[0].barWidth = "80%";
+  return opt;
+}
+
+function footprintRenderItem(params, api) {
+  const x = api.coord([api.value(0), api.value(1)])[0];
+  const y = api.coord([api.value(0), api.value(1)])[1];
+  if (x == null || y == null || !isFinite(x) || !isFinite(y)) {
+    return { type: "group", children: [] };
+  }
+  const stall = chartState.fpData && chartState.fpData.step ? chartState.fpData.step : 0.0001;
+  const w = Math.max(api.size([1, 0])[0], 1);
+  const h = Math.max(api.size([0, stall])[1], 1);
+  const delta = api.value(4);
+  const bid = api.value(2);
+  const ask = api.value(3);
+  const maxAbs = chartState.fpMaxDelta || 1;
+  const alpha = Math.min(Math.abs(delta) / maxAbs, 1) * 0.5 + 0.05;
+  const up = delta >= 0;
+  const fill = up ? `rgba(46,230,168,${alpha})` : `rgba(255,93,108,${alpha})`;
+  const children = [
+    {
+      type: "rect",
+      shape: { x, y, width: w, height: h, x2: 0, y2: 0, r: 0 },
+      style: { fill, stroke: "rgba(255,255,255,0.04)", lineWidth: 1 },
+    },
+  ];
+  // Matriz Bid × Ask: numérica cuando la celda es mínimamente ancha (zoomeado o
+  // pocas columnas visibles); si no, quedan solo los rectángulos de delta.
+  if (w >= 16 && h >= 8) {
+    const fs = Math.max(7, Math.min(10, Math.floor(w / 4)));
+    const bidTxt = String(Number(bid).toFixed(0));
+    const askTxt = String(Number(ask).toFixed(0));
+    const sideX = w * 0.24;
+    children.push(
+      {
+        type: "text",
+        style: {
+          text: bidTxt,
+          x: x + sideX,
+          y: y + h * 0.5,
+          textAlign: "center",
+          textVerticalAlign: "middle",
+          fill: delta >= 0 ? "#ffb3bf" : "#ffe0e4",
+          font: `${fs}px 'DM Sans', sans-serif`,
+        },
+      },
+      {
+        type: "text",
+        style: {
+          text: askTxt,
+          x: x + w - sideX,
+          y: y + h * 0.5,
+          textAlign: "center",
+          textVerticalAlign: "middle",
+          fill: delta >= 0 ? "#a9f5d8" : "#9be8c8",
+          font: `${fs}px 'DM Sans', sans-serif`,
+        },
+      }
+    );
+  }
+  return { type: "group", children };
+}
+
+// Heatmap / mapa de liquidez como serie CUSTOM renderItem. El heatmap nativo de
+// ECharts no puede dimensionar celdas sobre un eje Y continuo (type:"value"),
+// así que pintamos las franjas de liquidez a mano, igual que el footprint: cada
+// celda [x (categoría), y (precio exacto del ladder), valor, lo, hi] → rect en
+// [x, y] con ancho = banda del eje X y alto = bandas de precio reales lo/hi
+// (puntos medios entre niveles adyacentes del ladder). La serie queda con
+// z:1 (de fondo) y las velas con z:3 (delante).
+const HM_STOPS = [
+  { t: 0, r: 138, g: 108, b: 255, a: 0 },
+  { t: 0.4, r: 138, g: 108, b: 255, a: 0.12 },
+  { t: 0.7, r: 255, g: 200, b: 87, a: 0.3 },
+  { t: 1, r: 255, g: 180, b: 40, a: 0.42 },
+];
+
+function heatmapColor(t) {
+  const v = Math.min(Math.max(t, 0), 1);
+  let i = 0;
+  while (i < HM_STOPS.length - 2 && v > HM_STOPS[i + 1].t) i++;
+  const s0 = HM_STOPS[i];
+  const s1 = HM_STOPS[i + 1];
+  const f = s1.t - s0.t ? (v - s0.t) / (s1.t - s0.t) : 0;
+  const r = Math.round(s0.r + (s1.r - s0.r) * f);
+  const g = Math.round(s0.g + (s1.g - s0.g) * f);
+  const b = Math.round(s0.b + (s1.b - s0.b) * f);
+  const a = s0.a + (s1.a - s0.a) * f;
+  return `rgba(${r},${g},${b},${a.toFixed(3)})`;
+}
+
+function heatmapRenderItem(params, api) {
+  const cx = api.value(0);
+  const x = api.coord([cx, api.value(1)])[0];
+  const lo = api.value(3);
+  const hi = api.value(4);
+  const step = chartState.hmPriceStep || 0;
+  const yTop = api.coord([cx, hi != null ? hi : api.value(1) + step / 2])[1];
+  const yBot = api.coord([cx, lo != null ? lo : api.value(1) - step / 2])[1];
+  if (x == null || yTop == null || yBot == null || !isFinite(x) || !isFinite(yTop) || !isFinite(yBot)) {
+    return { type: "group", children: [] };
+  }
+  const w = Math.max(api.size([1, 0])[0], 1);
+  const h = Math.max(Math.abs(yBot - yTop), 1);
+  const raw = api.value(2);
+  const val = typeof raw === "number" && isFinite(raw) ? Math.max(raw, 0) : 0;
+  const maxV = chartState.hmMaxV || 1;
+  return {
+    type: "rect",
+    // api.coord devuelve el CENTRO de la banda en el eje de categoría
+    // (boundaryGap:true): centramos el rect para que cada columna quede bajo la
+    // vela. En vertical usamos los límites de precio reales de la fila
+    // (puntos medios del ladder), así el mosaico no deja costuras.
+    shape: { x: x - w / 2, y: Math.min(yTop, yBot), width: w, height: h, r: 0 },
+    style: {
+      fill: heatmapColor(val / maxV),
+      stroke: "rgba(255,255,255,0.03)",
+      lineWidth: 1,
+    },
+  };
+}
+
+function footprintTooltip(params) {
+  const p = Array.isArray(params) ? params[0] : params;
+  if (!p || !p.data) return "";
+  const d = p.data;
+  const t = d.time;
+  const digits = Math.abs(d.price) >= 1 ? 5 : 6;
+  const side = d.delta >= 0 ? "COMPRA" : "VENTA";
+  return [
+    `<div style="font-weight:600">${chartNiceTime(t)}</div>`,
+    `Precio: <b>${Number(d.price).toFixed(digits)}</b>`,
+    `Bid: ${Math.round(d.bid)} · Ask: ${Math.round(d.ask)}`,
+    `Delta: <b style="color:${d.delta >= 0 ? CHART_COLORS.up : CHART_COLORS.down}">${d.delta >= 0 ? "+" : ""}${Number(d.delta).toFixed(2)}</b> (${side})`,
+  ].join("<br>");
+}
+
+function applyFootprint(fp) {
+  if (!fp || !Array.isArray(fp.bars)) return;
+  chartState.fpData = fp;
+  if (!chart) return;
+  // El payload del servidor cubre SOLO la ventana [nueva] (últimas N velas tras
+  // la llamada MT5); el eje X usa esos timestamps reales, no los de lastCandles
+  // (que tiene hasta 1000 velas).
+  // NOTA: ECharts v6 no concatena los timestamps NUMÉRICOS del eje category con
+  // api.coord() (devuelve ~4e11 px => celdas fuera de viewport y con clip:true
+  // el renderItem nunca se ejecuta). Usamos claves string para que las celdas
+  // del footprint se dibujen en su banda equidistante.
+  const cat = fp.bars.map((b) => String(b.time));
+  const inCat = new Set(cat);
+  const candles = lastCandles.filter((c) => inCat.has(String(c.time)));
+  const cells = [];
+  let maxAbs = 1;
+  for (let bi = 0; bi < fp.bars.length; bi++) {
+    const b = fp.bars[bi];
+    const t = String(cat[bi]);
+    for (const lv of b.levels) {
+      const d = lv.delta;
+      if (Math.abs(d) > maxAbs) maxAbs = Math.abs(d);
+      cells.push({ value: [t, lv.price, lv.bid, lv.ask, d], time: b.time, price: lv.price, bid: lv.bid, ask: lv.ask, delta: d });
+    }
+  }
+  chartState.fpMaxDelta = maxAbs;
+  chart.setOption({
+    xAxis: [{ data: cat }],
+    series: [
+      { id: "candles", data: candles.map(candleToOhlc) },
+      { id: "footprint", data: cells },
+    ],
+  });
+}
+
+function applyHeatmap(hm) {
+  if (!hm || !Array.isArray(hm.data)) return;
+  chartState.hmData = hm;
+  if (!chart) return;
+  const cat0 = chartState.mode === "event" ? [] : lastCandles.map((c) => c.time);
+  // El servidor manda [t, i, v] con t = ÍNDICE de vela e i = índice de nivel.
+  // Traducimos ambos a valores reales: x = times[t] (timestamp), y = ladder[i].
+  // El eje X del heatmap se mantiene de CATEGORÍA (claves string); el eje Y es
+  // de VALOR con el precio exacto del ladder, y las velas se superponen encima.
+  // Cada celda se emite como [x, y, v, lo, hi]: lo/hi son los límites de precio
+  // reales (puntos medios entre niveles adyacentes del ladder) para que el
+  // renderItem dimensione cada franja sin costuras, incluso si el paso varía.
+  const times = (hm.times || cat0).map((t) => String(t));
+  const ladder = hm.ladder && hm.ladder.length ? hm.ladder.map(Number) : [];
+  const step = ladder.length > 1 ? ladder[1] - ladder[0] : 0;
+  chartState.hmPriceStep = step;
+  const cellLimits = (i, p) => [
+    i > 0 ? (ladder[i - 1] + p) / 2 : p - step / 2,
+    i < ladder.length - 1 ? (p + ladder[i + 1]) / 2 : p + step / 2,
+  ];
+  const cells = ladder.length && times.length
+    ? hm.data
+        .map((row) => {
+          const li = Number(row[1]);
+          const x = times[row[0]] !== undefined ? times[row[0]] : String(row[0]);
+          const p = ladder[li] !== undefined ? ladder[li] : row[1];
+          const [lo, hi] = ladder[li] !== undefined ? cellLimits(li, p) : [undefined, undefined];
+          return [x, p, row[2], lo, hi];
+        })
+        .filter((row) => row[0] !== undefined && row[1] !== undefined)
+    : hm.data.map((row) => [String(row[0]), row[1], row[2]]);
+  const maxV = hm.data.reduce((m, row) => Math.max(m, Number(row[2]) || 0), 0) || 1;
+  chartState.hmMaxV = maxV;
+  // Aire en el eje Y: dos pasos del ladder arriba y abajo, para que las mechas
+  // extremas no queden pegadas al borde del canvas (media franja ya la cubre el
+  // pad mínimo que necesita la fila extrema para no quedar cortada).
+  const yPad = step * 2;
+  const inTimes = new Set(times);
+  const candles = lastCandles.filter((c) => inTimes.has(String(c.time)));
+  chart.setOption({
+    yAxis: [
+      {
+        min: ladder.length ? ladder[0] - yPad : undefined,
+        max: ladder.length ? ladder[ladder.length - 1] + yPad : undefined,
+      },
+    ],
+    xAxis: [{ data: times }],
+    series: [
+      { id: "candles", z: 3, data: candles.map(candleToOhlc) },
+      { id: "heatmap", z: 1, data: cells },
+    ],
+  });
+}
+
+async function loadFootprint(fit) {
+  const symbol = chartState.symbol;
+  const tf = chartState.tf;
+  if (!symbol) return;
+  try {
+    const res = await fetch(
+      `/api/analysis/footprint/${encodeURIComponent(symbol)}?timeframe=${tf}&bars=80&rows=12${fixtureMode ? "&mode=test" : ""}`
+    );
+    if (!res.ok) {
+      // Un 404/500 silencioso dejaba el gráfico con velas estándar sin explicación.
+      const err = await res.json().catch(() => null);
+      const msg = err && err.error ? `Footprint: ${err.error}` : `Footprint: HTTP ${res.status}`;
+      if (fixtureMode) chartMsg(msg);
+      else chartMsg(msg, { label: "Usar fixture de test (sin MT5)", handler: enableFixtureMode });
+      return;
+    }
+    chartMsg(null);
+    applyFootprint(await res.json());
+    if (fit) chart.setOption({ dataZoom: [{ start: 0, end: 100 }], animation: false });
+  } catch (err) {
+    chartMsg(`Footprint: ${err.message}`);
+  }
+}
+
+async function loadHeatmap(fit) {
+  const symbol = chartState.symbol;
+  const tf = chartState.tf;
+  if (!symbol) return;
+  try {
+    const res = await fetch(
+      `/api/analysis/heatmap/${encodeURIComponent(symbol)}?timeframe=${tf}&bars=150&levels=64${fixtureMode ? "&mode=test" : ""}`
+    );
+    if (!res.ok) {
+      const err = await res.json().catch(() => null);
+      const msg = err && err.error ? `Heatmap: ${err.error}` : `Heatmap: HTTP ${res.status}`;
+      if (fixtureMode) chartMsg(msg);
+      else chartMsg(msg, { label: "Usar fixture de test (sin MT5)", handler: enableFixtureMode });
+      return;
+    }
+    chartMsg(null);
+    applyHeatmap(await res.json());
+    if (fit) chart.setOption({ dataZoom: [{ start: 0, end: 100 }], animation: false });
+  } catch (err) {
+    chartMsg(`Heatmap: ${err.message}`);
+  }
+}
+
+function applyEventBars(bars) {
+  if (!bars || !Array.isArray(bars) || !bars.length) return;
+  chartState.eventBars = bars;
+  if (!chart) return;
+  // Catálogo equidistante: el eje X es CATEGORÍA indexado por barra de evento.
+  // Se usan los timestamps como data (para que tooltip/drawing mantengan coords
+  // reales) pero la etiqueta se muestra como número de orden de la barra.
+  const cat = bars.map((b) => b.time);
+  const total = Math.max(cat.length, 1);
+  const show = Math.min(320, total);
+  const start = Math.max(0, 100 - (show / total) * 100);
+  chart.setOption({
+    xAxis: [{ data: cat, axisLabel: { formatter: eventBarLabel } }],
+    series: [
+      {
+        id: "candles",
+        markArea: { data: [] },
+        markLine: { data: [] },
+        markPoint: { data: [] },
+        data: bars.map((b) => [b.open, b.close, b.low, b.high]),
+      },
+    ],
+    dataZoom: [
+      { type: "inside", xAxisIndex: 0, start, end: 100 },
+      {
+        type: "slider",
+        xAxisIndex: 0,
+        start,
+        end: 100,
+        height: 14,
+        bottom: 0,
+        borderColor: CHART_COLORS.border,
+        backgroundColor: "rgba(255,255,255,0.02)",
+        fillerColor: "rgba(138,108,255,0.12)",
+        dataBackground: {
+          lineStyle: { color: CHART_COLORS.text, opacity: 0.35 },
+          areaStyle: { color: "rgba(255,255,255,0.05)" },
+        },
+        selectedDataBackground: {
+          lineStyle: { color: CHART_COLORS.cvdTop },
+          areaStyle: { color: "rgba(138,108,255,0.15)" },
+        },
+        handleStyle: { color: CHART_COLORS.cvdTop },
+        textStyle: { color: CHART_COLORS.text, fontSize: 10 },
+      },
+    ],
+  });
+}
+
+async function loadEventBars(fit) {
+  const symbol = chartState.symbol;
+  const tf = chartState.tf;
+  if (!symbol) return;
+  const mode = els.evMode ? els.evMode.value : "volbar";
+  const param = els.evParam ? Math.max(1, parseInt(els.evParam.value, 10) || 500) : 500;
+  try {
+    const res = await fetch(
+      `/api/analysis/eventbars/${encodeURIComponent(symbol)}?timeframe=${tf}&bars=1000&mode=${mode}&param=${param}`
+    );
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!data || !Array.isArray(data.bars)) return;
+    applyEventBars(data.bars);
+    if (fit) chart.setOption({ dataZoom: [{ start: 0, end: 100 }], animation: false });
+  } catch (_) {}
+}
+
+function setChartMode(mode) {
+  if (!chartModeSupported(mode)) return;
+  chartState.mode = mode;
+  const btns = els.chartMode ? els.chartMode.querySelectorAll("button[data-mode]") : [];
+  btns.forEach((b) => b.classList.toggle("active", b.dataset.mode === mode));
+  if (els.evControls) els.evControls.hidden = mode !== "event";
+  updateTfGroupDisabled();
+  const src = MODE_SOURCE[mode] || MODE_SOURCE.classic;
+  if (els.sourceChip) {
+    els.sourceChip.textContent = fixtureMode && (mode === "footprint" || mode === "heatmap")
+      ? `${src} · TEST`
+      : src;
+    els.sourceChip.classList.toggle("synthetic", src.indexOf("SINTÉTICO") !== -1);
+  }
+  // Resetea overlays derivados antes de recargar.
+  vpData = null;
+  cvdOverlayOn = false;
+  if (els.btnCvd) els.btnCvd.classList.remove("active");
+  journalOverlayOn = false;
+  lastPatternData = null;
+  AGENT_OVERLAYS.markArea = [];
+  AGENT_OVERLAYS.markPoint = [];
+  SETUP_OVERLAY.markLine = [];
+  SETUP_OVERLAY.markPoint = [];
+  loadCandles(true);
+}
+
+function chartModeSupported(mode) {
+  return ["classic", "footprint", "heatmap", "vp", "event"].includes(mode);
+}
+
+// En Event Bars el agrupamiento de la vela lo controla el parámetro de
+// ticks/volumen (evParam), no el timeframe: los botones M1..W1 se desactivan
+// para evitar el conflicto de temporalidad mientras el modo esté activo.
+function updateTfGroupDisabled() {
+  const disabled = chartState.mode === "event";
+  const tfBtns = els.tfGroup ? els.tfGroup.querySelectorAll("button[data-tf]") : [];
+  tfBtns.forEach((b) => (b.disabled = disabled));
+}
+
 function initChart() {
   if (chart || typeof echarts === "undefined") return;
   chart = echarts.init(els.chartEl);
   chart.setOption(baseChartOption());
+  chartOptionIsDerived = false;
   window.DrawingTools?.attach(chart, {
     getSymbol: () => chartState.symbol,
     getTimeframe: () => chartState.tf,
@@ -824,6 +1464,15 @@ const candleToOhlc = (c) => [
 function chartSyncData() {
   if (!chart) return;
   const cat = lastCandles.map((c) => c.time);
+  // En los modos derivados (footprint/heatmap) solo existe un grid: actualizar
+  // el eje X de velas no puede referenciar un segundo eje que no existe.
+  if (chartState.mode === "footprint" || chartState.mode === "heatmap") {
+    chart.setOption({
+      xAxis: [{ data: cat }],
+      series: [{ id: "candles", data: lastCandles.map(candleToOhlc) }],
+    });
+    return;
+  }
   // El eje X y la serie de velas se actualizan SIEMPRE juntos (mismo setOption):
   // si llega una vela con timestamp nuevo, crece xAxis.data; si es el mismo, se
   // actualiza la vela en su posición.
@@ -834,7 +1483,14 @@ function chartSyncData() {
 }
 
 function applyLiveBar(bar) {
+  if (auditActive) return; // el gráfico muestra un audit, no velas en vivo
   if (!chart || !bar || bar.time === undefined) return;
+  if (chartState.mode === "footprint" || chartState.mode === "heatmap" || chartState.mode === "event") {
+    // En los modos derivados las barras se reconstruyen desde el snapshot
+    // sintético (refetch debounced). Solo se actualiza la cotización en vivo.
+    scheduleDerivedRefresh();
+    return;
+  }
   const idx = chartIndexMap.get(bar.time);
   if (idx !== undefined && idx < lastCandles.length) {
     lastCandles[idx] = bar;
@@ -859,6 +1515,7 @@ let lastPatternData = null;
 
 function setPatternZones(data) {
   if (!chart) return;
+  if (chartState.mode === "event") return; // las velas por evento usan su propio eje X
   lastPatternData = data;
   const patterns = data.patterns || {};
   const lastT = lastCandles.length ? lastCandles[lastCandles.length - 1].time : null;
@@ -1115,12 +1772,40 @@ function applyVolumeProfile(data) {
       { id: "vp", data: vpSortedRows.map((r, i) => [r.vol, i]) },
     ],
   });
+  if (chartState.mode === "vp") {
+    const line = (price, color, label) => ({
+      yAxis: price,
+      lineStyle: { color, type: "dashed", width: 1 },
+      label: { show: true, formatter: label, color, position: "insideEndTop", fontSize: 10 },
+      silent: true,
+    });
+    chart.setOption({
+      series: [
+        {
+          id: "candles",
+          markLine: {
+            silent: true,
+            symbol: "none",
+            data: [
+              line(data.poc, "#ffe082", "PoC"),
+              line(data.vah, "#82b1ff", "VAH"),
+              line(data.val, "#82b1ff", "VAL"),
+            ],
+          },
+        },
+      ],
+    });
+    redrawPatterns(); // restaura markLines de patrones/agente encima de los niveles VP
+    showVolumeProfile();
+  }
 }
 
 function loadVolumeProfile() {
   if (!chartState.symbol) return;
   const bins = Math.max(30, Math.min(60, Math.round(((els.chartEl && els.chartEl.clientHeight) || 400) / 6)));
-  fetch(`/api/volume-profile/${chartState.symbol}?timeframe=H1&bins=${bins}`)
+  const tf = chartState.mode === "vp" ? chartState.tf : "H1";
+
+  fetch(`/api/volume-profile/${chartState.symbol}?timeframe=${tf}&bins=${bins}`)
     .then((r) => (r.ok ? r.json() : null))
     .then((data) => {
       if (data && Array.isArray(data.profile)) {
@@ -1220,6 +1905,7 @@ function clearPatterns() {
 
 async function refreshPatterns() {
   if (!chart || !chartState.symbol || patternBusy) return;
+  if (chartState.mode === "event") return;
   const tf = chartState.tf;
   if (!PATTERN_TFS.includes(tf)) {
     clearPatterns();
@@ -1242,6 +1928,78 @@ async function refreshPatterns() {
   } finally {
     patternBusy = false;
   }
+}
+
+/* ---- Chartismo clásico (capas toggle por botón) ---- */
+
+function chartismBtn(kind) {
+  return kind ? document.querySelector(`#drawTools [data-kind="${kind}"]`) : null;
+}
+
+function syncChartismButtons() {
+  for (const k of Object.keys(CHARTISM_GROUPS)) {
+    const b = chartismBtn(k);
+    if (b) b.classList.toggle("active", chartismLayers.has(k));
+  }
+}
+
+function resetChartismLayers() {
+  chartismLayers.clear();
+  syncChartismButtons();
+}
+
+async function toggleChartism(kind) {
+  if (!chart || !CHARTISM_GROUPS[kind]) return;
+
+  const btn = chartismBtn(kind);
+  if (chartismLayers.has(kind)) {
+    chartismLayers.delete(kind);
+    window.DrawingTools?.removeByGroup?.(kind);
+    if (btn) btn.classList.remove("active");
+    return;
+  }
+
+  if (btn) {
+    btn.classList.add("active");
+    btn.disabled = true;
+  }
+
+  try {
+    const res = await fetch(
+      `/api/analysis/chartism/${encodeURIComponent(chartState.symbol)}` +
+        `?timeframe=${chartState.tf}&bars=300&patterns=${kind}`
+    );
+    if (!res.ok) throw new Error("http " + res.status);
+    const data = await res.json();
+    // Regenera la capa (limpia dibujos previos del grupo antes de dibujar).
+    window.DrawingTools?.removeByGroup?.(kind);
+    const drawings = (data.drawings || []).map((d) => ({
+      ...d,
+      origin: "chartism",
+      group: d.group || kind,
+    }));
+    window.DrawingTools?.addAgentDrawings?.(drawings, "chartism");
+    chartismLayers.add(kind);
+    const count = (data.summary || {})[kind] || 0;
+    if (count) {
+      toast(`Chartismo ${CHARTISM_GROUPS[kind]}: ${count} figura(s) dibujada(s).`, "ok");
+    } else {
+      toast(`Sin figuras de ${CHARTISM_GROUPS[kind].toLowerCase()} en ${chartState.tf}.`, "err");
+      if (btn) btn.classList.remove("active");
+    }
+  } catch (err) {
+    chartismLayers.delete(kind);
+    if (btn) btn.classList.remove("active");
+    toast("No se pudo dibujar chartismo", "err");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function clearChartism() {
+  window.DrawingTools?.removeByOrigin?.("chartism");
+  chartismLayers.clear();
+  syncChartismButtons();
 }
 
 function quoteDigits(price) {
@@ -1291,6 +2049,56 @@ async function loadCandles(fit = false) {
     initChart();
     lastCandles = data;
     chartIndexMap.clear();
+    chartState.fpData = null;
+    chartState.hmData = null;
+    chartState.hmMaxV = 1;
+    chartState.hmPriceStep = 0;
+
+    const mode = chartState.mode;
+
+    if (mode === "footprint") {
+      chart.setOption(buildDerivedBaseOption("footprint"), { notMerge: true });
+      chartOptionIsDerived = true;
+      chartSyncData();
+      loadFootprint(fit);
+      startStream();
+      chartMsg(null);
+      chartState.lastBid = null;
+      fetchQuote();
+      window.DrawingTools?.onBars?.(data);
+      return;
+    }
+    if (mode === "heatmap") {
+      chart.setOption(buildDerivedBaseOption("heatmap"), { notMerge: true });
+      chartOptionIsDerived = true;
+      chartSyncData();
+      loadHeatmap(fit);
+      startStream();
+      chartMsg(null);
+      chartState.lastBid = null;
+      fetchQuote();
+      window.DrawingTools?.onBars?.(data);
+      return;
+    }
+    if (mode === "event") {
+      chart.setOption(buildEventBarsOption(), { notMerge: true });
+      chartOptionIsDerived = true;
+      chartMsg(null);
+      chartState.lastBid = null;
+      fetchQuote();
+      startStream();
+      loadEventBars(fit);
+      return;
+    }
+
+    // classic / vp
+    if (chartOptionIsDerived) {
+      // Restaura la opción base completa (3 grids, ejes pristine) tras salir de
+      // un modo derivado; si no, los ejes quedan corruptos (timestamps y
+      // volúmenes crudos sobre el eje de precio).
+      chart.setOption(baseChartOption(), { notMerge: true });
+      chartOptionIsDerived = false;
+    }
     chartSyncData();
     refreshPatterns();
     if (fit) {
@@ -1304,8 +2112,10 @@ async function loadCandles(fit = false) {
     fetchQuote();
     startStream();
     loadCvdData(data, chartState.tf);
+    if (mode === "vp") loadVolumeProfile();
     window.DrawingTools?.onBars?.(data);
     window.DrawingTools?.reload?.();
+    resetChartismLayers();
   } catch (err) {
     chartMsg(`No hay datos para ${symbol}: ${err.message}`);
   }
@@ -1376,11 +2186,23 @@ async function updateChart() {
 
 els.tfGroup.addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-tf]");
-  if (!btn) return;
+  if (!btn || btn.disabled || chartState.mode === "event") return;
   els.tfGroup.querySelectorAll("button").forEach((b) => b.classList.remove("active"));
   btn.classList.add("active");
   chartState.tf = btn.dataset.tf;
   loadCandles(true);
+});
+
+els.chartMode.addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-mode]");
+  if (!btn || btn.dataset.mode === chartState.mode) return;
+  setChartMode(btn.dataset.mode);
+});
+els.evMode.addEventListener("change", () => {
+  if (chartState.mode === "event") loadEventBars(true);
+});
+els.evParam.addEventListener("change", () => {
+  if (chartState.mode === "event") loadEventBars(true);
 });
 
 els.btnChartAssistant.addEventListener("click", analizarGrafico);
@@ -1878,19 +2700,73 @@ const ofEls = {
   absorbWin: document.getElementById("ofAbsorbWin"),
   feedToggle: document.getElementById("feedToggle"),
   feedToggleLabel: document.getElementById("feedToggleLabel"),
+  ofSource: document.getElementById("ofSource"),
+  ofFixture: document.getElementById("ofFixture"),
+  ofControls: document.getElementById("ofControls"),
+  ofSourceChip: document.getElementById("ofSourceChip"),
 };
+
+function ofLoadFixtures() {
+  fetch("/api/orderflow/fixtures")
+    .then((r) => r.json())
+    .then((resp) => {
+      const sel = ofEls.ofFixture;
+      sel.innerHTML = '<option value="">— escenario —</option>';
+      for (const s of resp.scenarios || []) {
+        const opt = document.createElement("option");
+        opt.value = s.id;
+        opt.dataset.kind = s.kind;
+        const label = s.regime ? `● ${s.regime}` : `fixture: ${s.id.replace("fixture_", "")}`;
+        opt.textContent = `${label}${s.kind === "fixture" ? " (.jsonl)" : ""}`;
+        sel.appendChild(opt);
+      }
+      if (ofSourceSelected() === "mock") ofEls.ofFixture.hidden = false;
+    })
+    .catch(() => {});
+}
+
+function ofSourceSelected() {
+  return ofEls.ofSource ? ofEls.ofSource.value : "live";
+}
+
+function ofFixtureSelected() {
+  return ofSourceSelected() === "mock" ? ofEls.ofFixture.value : null;
+}
 
 function ofApplyFeed(status) {
   if (!status) return;
   const on = !!status.enabled;
   const connected = !!status.connected;
+  const mock =
+    status.enabled && ("source" in status || "mode" in status)
+      ? status.mode === "mock" || status.source === "mock"
+      : ofSourceSelected() === "mock";
+  const mockAvail = status.mock_available !== undefined ? !!status.mock_available : true;
   ofEls.feedToggle.checked = on;
   const label = on ? (connected ? "Conectado" : "Conectando...") : "Apagado";
   ofEls.feedToggleLabel.textContent = label;
   ofEls.feedToggleLabel.classList.toggle("on", on && connected);
   ofEls.feedToggleLabel.classList.toggle("off", !on);
+
+  if (ofEls.ofControls) ofEls.ofControls.hidden = !mockAvail;
+  if (ofEls.ofSource) {
+    if (!mockAvail) ofEls.ofSource.value = "live";
+    else if (ofEls.ofSource.value !== (mock ? "mock" : "live")) {
+      ofEls.ofSource.value = mock ? "mock" : "live";
+      ofEls.ofFixture.hidden = !(mockAvail && mock);
+    }
+  }
+  if (ofEls.ofFixture) ofEls.ofFixture.hidden = !(mockAvail && mock);
+
+  if (ofEls.ofSourceChip) {
+    const chip = ofEls.ofSourceChip;
+    chip.textContent = mock ? "fuente: SINTÉTICO 6E (MOCK)" : "fuente: DATABENTO 6E";
+    chip.classList.toggle("mock", mock);
+    chip.classList.toggle("live", !mock);
+  }
+
   if (on && connected) {
-    ofSetConn("connected", "6E en línea");
+    ofSetConn("connected", mock ? "6E MOCK en línea" : "6E en línea");
   } else if (on) {
     ofSetConn("connecting", "conectando 6E...");
   } else {
@@ -2013,15 +2889,54 @@ function ofInitChart() {
   });
 }
 
+function ofClearChart() {
+  ofCvdPoints.length = 0;
+  ofIndexMap.clear();
+  if (ofChart) {
+    ofChart.setOption({ xAxis: { data: [] }, series: [{ data: [] }] });
+  }
+}
+
+function ofLoadHistory() {
+  fetch("/api/orderflow/cvd")
+    .then((r) => (r.ok ? r.json() : []))
+    .then((series) => {
+      ofInitChart();
+      if (!ofChart || !Array.isArray(series) || !series.length) return;
+      ofClearChart();
+      ofState.lastTs = null;
+      for (const p of series) {
+        if (p && p.time != null && p.value != null) {
+          ofIndexMap.set(Math.floor(p.time), ofCvdPoints.length);
+          ofCvdPoints.push([String(Math.floor(p.time)), p.value]);
+        }
+      }
+      ofUpdateCvdTexture();
+    })
+    .catch(() => {});
+}
+
+function ofUpdateCvdTexture() {
+  if (!ofChart) return;
+  if (ofCvdPoints.length) {
+    ofChart.setOption({
+      xAxis: { data: ofCvdPoints.map((d) => d[0]) },
+      series: [{ data: ofCvdPoints }],
+    });
+  }
+}
+
 function ofUpdateCvd(ts, cvd, delta) {
-  const t = ts ? Math.floor(ts) : undefined;
+  // Eje X del chart: ts del payload (epoch secs). Si el servidor no lo manda,
+  // se usa el reloj local para no dejar de pintar la curva en tiempo real.
+  const t = ts != null ? Math.floor(ts) : Math.floor(Date.now() / 1000);
   if (ofChart && t != null) {
     const data = ofCvdPoints;
     const idx = ofIndexMap.get(t);
-    if (idx !== undefined && idx < data.length) data[idx] = [t, cvd];
+    if (idx !== undefined && idx < data.length) data[idx] = [String(t), cvd];
     else {
       ofIndexMap.set(t, data.length);
-      data.push([t, cvd]);
+      data.push([String(t), cvd]);
     }
     if (data.length > 3000) {
       const removed = data.length - 3000;
@@ -2136,16 +3051,32 @@ function ofSendSettings() {
 }
 
 function ofSendFeed(action) {
+  const mode = ofSourceSelected();
+  const fixture = ofFixtureSelected();
+  const body =
+    action === "feed_start"
+      ? { action, mode, ...(mode === "mock" && fixture ? { fixture } : {}) }
+      : { action };
   const socket = OF_STATUS.socket;
   if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({ action }));
+    socket.send(JSON.stringify(body));
   } else {
     fetch("/api/orderflow/feed", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action }),
+      body: JSON.stringify(body),
     }).catch(() => {});
   }
+}
+
+function ofHandleTrade(data) {
+  ofInitChart();
+  ofState.cvd = data.cvd;
+  ofState.lastTrade = data;
+  OF_STATUS.spikeCount = data.spike_count;
+  ofRenderKpis();
+  ofUpdateCvd(data.ts ? Math.floor(data.ts) : undefined, data.cvd, data.delta);
+  if (data.is_spike || data.absorption) ofAddAlert(data);
 }
 
 function ofConnect() {
@@ -2209,13 +3140,12 @@ function ofConnect() {
     }
 
     if (data.event === "trade") {
-      ofInitChart();
-      ofState.cvd = data.cvd;
-      ofState.lastTrade = data;
-      OF_STATUS.spikeCount = data.spike_count;
-      ofRenderKpis();
-      ofUpdateCvd(data.ts ? Math.floor(data.ts) : undefined, data.cvd, data.delta);
-      if (data.is_spike || data.absorption) ofAddAlert(data);
+      ofHandleTrade(data);
+      return;
+    }
+
+    if (data.event === "batch") {
+      for (const t of data.trades || []) ofHandleTrade(t);
     }
   };
 
@@ -2244,21 +3174,46 @@ ofEls.feedToggle.addEventListener("change", () => {
   const action = ofEls.feedToggle.checked ? "feed_start" : "feed_stop";
   ofApplyFeed({ enabled: ofEls.feedToggle.checked, connected: false });
   if (action === "feed_start") {
-    ofSetConn("connecting", "conectando 6E...");
+    const mock = ofSourceSelected() === "mock";
+    ofSetConn("connecting", mock ? "conectando MOCK 6E..." : "conectando 6E...");
     ofEls.feedToggleLabel.textContent = "Conectando...";
+    ofClearChart();
   } else {
     ofEls.feedToggleLabel.textContent = "Apagado";
     ofEls.feedToggleLabel.classList.remove("on");
     ofEls.feedToggleLabel.classList.add("off");
+    ofLoadHistory();
   }
   ofSendFeed(action);
 });
+
+if (ofEls.ofSource) {
+  ofEls.ofSource.addEventListener("change", () => {
+    const mock = ofSourceSelected() === "mock";
+    ofEls.ofFixture.hidden = !mock;
+    if (mock) {
+      ofEls.ofSourceChip.textContent = "fuente: SINTÉTICO 6E (MOCK)";
+      ofEls.ofSourceChip.classList.toggle("live", false);
+      ofEls.ofSourceChip.classList.toggle("mock", true);
+      ofLoadHistory();
+    } else {
+      ofEls.ofFixture.value = "";
+      ofEls.ofSourceChip.textContent = "fuente: DATABENTO 6E";
+      ofEls.ofSourceChip.classList.toggle("live", true);
+      ofEls.ofSourceChip.classList.toggle("mock", false);
+    }
+  });
+}
+
+ofLoadFixtures();
 
 /* Inicializar el interruptor con el estado del servidor */
 fetch("/api/orderflow/feed")
   .then((r) => r.json())
   .then((status) => ofApplyFeed(status))
   .catch(() => {});
+
+ofLoadHistory();
 
 /* ============================================================
    Trading desde el dashboard (espejo de los EAs MQL5)
@@ -2642,6 +3597,660 @@ async function confirmClose() {
   }
 }
 
+/* ============================================================
+   Investigación / Backtest (pipeline research/)
+   ============================================================ */
+let resChartObj = null;
+let resSaved = null;
+let resLast = null;
+const RES_ENDPOINTS = {
+  export: "/api/research/export",
+  validate: "/api/research/validate",
+  backtest: "/api/research/backtest",
+  calibrate: "/api/research/calibrate",
+  search: "/api/research/search",
+};
+
+function resResolve() {
+  return {
+    symbol: (els.resSymbol.value || "EURUSD").toUpperCase().trim(),
+    timeframe: els.resTf.value || "M15",
+    days: Math.max(1, parseInt(els.resDays.value, 10) || 90),
+  };
+}
+
+function resBusy(on) {
+  const btns = [els.resExportBtn, els.resValidateBtn, els.resBacktestBtn, els.resCalibrateBtn, els.resSearchBtn, els.resExplainBtn];
+  btns.forEach((b) => {
+    if (b) b.disabled = on;
+  });
+  if (on) {
+    els.resStatus.hidden = false;
+    els.resStatus.textContent =
+      "Ejecutando pipeline offline (subproceso de research/run_research.py)… puede tardar unos segundos.";
+    els.resStatus.className = "res-status res-info";
+  }
+}
+
+function resShowStatus(kind, data) {
+  const sym = resResolve();
+  els.resStatus.hidden = false;
+  els.resStatus.className = "res-status res-ok";
+  if (kind === "search") {
+    const base = Object.entries(data.base || {})
+      .map(([k, v]) => `${k}=${v}`).join(", ");
+    els.resStatus.textContent =
+      `Grid search ${sym.symbol} ${sym.timeframe} · ${data.combos} combo(s) → Top ${(data.results || []).length} · mínimo ${data.min_filled} fills · base «${base}»` +
+      (data.saved ? ` · ${data.saved}` : "");
+    return;
+  }
+  if (kind === "validate") {
+    const checks = (data && data.checks) || {};
+    const nok = Object.values(checks).filter((v) => v).length;
+    const n = Object.keys(checks).length;
+    els.resStatus.textContent =
+      `Validación ${sym.symbol} ${sym.timeframe} · ${data.n_bars} velas · ${nok}/${n} checks OK` +
+      ((data.warnings || []).length ? ` · ${data.warnings.length} advertencia(s)` : "") +
+      (data.lookahead_mismatches ? ` · ${data.lookahead_mismatches} fugas look-ahead` : "");
+    return;
+  }
+  const m = (data && data.metrics) || {};
+  const parts = [`${sym.symbol} ${sym.timeframe} · ${data.run ? (data.run.n_bars ?? "?") : "?"} velas`];
+  if (m.n_filled != null) parts.push(`${m.n_filled} fills`);
+  if (m.win_rate != null) parts.push(`WR ${num(m.win_rate, 1)}%`);
+  if (m.expectancy_r != null) parts.push(`E ${num(m.expectancy_r, 2)}R`);
+  if (m.profit_factor != null) parts.push(`PF ${num(m.profit_factor, 2)}`);
+  if (m.max_dd_equity_pct != null) parts.push(`DD ${num(m.max_dd_equity_pct, 1)}%`);
+  if (data.saved) parts.push(`› ${data.saved}`);
+  els.resStatus.textContent = parts.join(" · ");
+}
+
+function resShowError(err) {
+  els.resStatus.hidden = false;
+  els.resStatus.textContent = (err && String(err)) || "Error ejecutando el pipeline.";
+  els.resStatus.className = "res-status res-err";
+}
+
+function resKpi(label, value, cls) {
+  return `<article class="res-kpi"><span class="res-kpi-label">${label}</span>` +
+    `<span class="res-kpi-value ${cls || ""}">${value}</span></article>`;
+}
+
+function resRenderKpis(m) {
+  els.resKpis.innerHTML = m ? [
+    resKpi("Trades", num(m.n, 0)),
+    resKpi("Fills", num(m.n_filled, 0)),
+    resKpi("Win rate", m.win_rate != null ? num(m.win_rate, 1) + "%" : "—"),
+    resKpi("Esperanza", m.expectancy_r != null ? num(m.expectancy_r, 2) + "R" : "—", m.expectancy_r != null && m.expectancy_r >= 0 ? "profit-pos" : "profit-neg"),
+    resKpi("Profit factor", m.profit_factor != null ? num(m.profit_factor, 2) : "—"),
+    resKpi("Max DD", m.max_dd_equity_pct != null ? num(m.max_dd_equity_pct, 2) + "%" : "—"),
+    resKpi("Espiradas", m.n_expired != null ? num(m.n_expired, 0) : "—"),
+    resKpi("Canceladas", m.n_cancelled != null ? num(m.n_cancelled, 0) : "—"),
+  ].join("") : `<div class="res-warn">Sin métricas de este run.</div>`;
+}
+
+function resRenderEquity(trades) {
+  const el = els.resChart;
+  if (!el) return;
+  if (!window.echarts) return;
+  const closed = (trades || [])
+    .filter((t) => t.pnl_r != null)
+    .slice()
+    .sort((a, b) => (a.fill_ts || 0) - (b.fill_ts || 0));
+  const points = [{ x: "#0", y: 100, ts: null, r: 0 }];
+  let eq = 100;
+  closed.forEach((t, i) => {
+    eq *= 1 + t.pnl_r * 0.01;
+    points.push({ x: "#" + String(i + 1), y: +eq.toFixed(4), ts: t.fill_ts, r: t.pnl_r });
+  });
+  if (resChartObj) { resChartObj.dispose(); resChartObj = null; }
+  resChartObj = echarts.init(el, null, { renderer: "canvas" });
+  resChartObj.setOption({
+    backgroundColor: "transparent",
+    grid: { left: 48, right: 20, top: 20, bottom: 28 },
+    tooltip: {
+      trigger: "axis",
+      backgroundColor: "rgba(13,19,34,0.95)",
+      borderColor: "rgba(255,255,255,0.15)",
+      textStyle: { color: "#eef1fa", fontSize: 12 },
+      formatter: (ps) => {
+        const p = ps && ps[0];
+        if (!p || !p.data) return "";
+        const d = p.data;
+        const when = d.ts ? chartNiceTime(d.ts) : "inicio";
+        return `<b>${d.x}</b> · ${when}<br/>Capital ${num(d.y, 2)} · trade ${d.r != null ? num(d.r, 2) + " R" : "—"}`;
+      },
+    },
+    xAxis: { type: "category", data: points.map((p) => p.x), axisLine: { lineStyle: { color: "rgba(255,255,255,0.15)" } }, axisLabel: { color: "#67708f", fontSize: 11 } },
+    yAxis: { type: "value", scale: true, splitLine: { lineStyle: { color: "rgba(255,255,255,0.07)" } }, axisLabel: { color: "#67708f", fontSize: 11 } },
+    series: [{
+      type: "line",
+      data: points.map((p) => ({ value: p.y, ...p })),
+      showSymbol: false,
+      lineStyle: { color: "#2ee6a8", width: 2 },
+      areaStyle: { color: "rgba(46,230,168,0.10)" },
+    }],
+  });
+}
+
+function resSugVal(v) {
+  if (v === null || v === undefined) return "—";
+  if (typeof v === "object") return esc(JSON.stringify(v));
+  return num(v, 2);
+}
+
+function resRenderSuggestions(suggestions, warnings) {
+  const el = els.resSuggestions;
+  if (!el) return;
+  const html = [];
+  if (suggestions && suggestions.length) {
+    html.push('<div class="res-suggest-head">Sugerencias del calibrador (nunca escriben strategy.yaml)</div>');
+    for (const s of suggestions) {
+      const conf = (s.confidence || "ok").toLowerCase();
+      const path = (s.path || []).join(".");
+      const payload = JSON.stringify({ key: s.key, value: s.suggested, current: s.current });
+      html.push(
+        `<div class="res-sug-row">` +
+          `<b>${esc(path || s.key || "")}</b>` +
+          `<span>${resSugVal(s.current)} → <b>${resSugVal(s.suggested)}</b></span>` +
+          `<span class="res-conf ${conf}">${esc(s.confidence || "ok")}</span>` +
+          `<span class="res-sug-reason">${esc(s.reason || "")}</span>` +
+          `<button type="button" class="btn apply-btn" data-res-apply="${esc(payload)}">Aplicar</button>` +
+        `</div>`
+      );
+    }
+  }
+  for (const w of warnings || []) {
+    html.push(`<div class="res-warn">⚠ ${esc(w)}</div>`);
+  }
+  if (html.length) el.innerHTML = html.join("");
+  if (el) {
+    el.querySelectorAll("[data-res-apply]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        try {
+          const it = JSON.parse(btn.getAttribute("data-res-apply"));
+          applyOpen([{ key: it.key, value: it.value, current: it.current }]);
+        } catch (_) {}
+      });
+    });
+  }
+}
+
+function resBreakdownTable(title, sub) {
+  if (!sub || !Object.keys(sub).length) return "";
+  const rows = Object.entries(sub)
+    .map(([k, v]) => `<tr><td>${esc(k)}</td><td>${num(v.n, 0)} · ${num(v.n_filled, 0)} fills</td>` +
+      `<td>${v.win_rate != null ? num(v.win_rate, 1) + "%" : "—"}</td>` +
+      `<td>${v.expectancy_r != null ? num(v.expectancy_r, 2) + "R" : "—"}</td></tr>`)
+    .join("");
+  return `<table class="res-bd-table"><thead><tr><th colspan="4">${title}</th></tr></thead>` +
+    `<tbody>${rows}</tbody></table>`;
+}
+
+function resRenderBreakdowns(breakdowns) {
+  if (!els.resBreakdown) return;
+  if (!breakdowns || !Object.keys(breakdowns).length) {
+    els.resBreakdown.innerHTML = "";
+    return;
+  }
+  const cols = [
+    resBreakdownTable("Por dirección", breakdowns.by_direction),
+    resBreakdownTable("Por killzone", breakdowns.by_killzone),
+    resBreakdownTable("Por tipo de entrada", breakdowns.by_entry_kind),
+  ].join("");
+  els.resBreakdown.innerHTML = `<div class="res-breakdown-row">${cols}</div>`;
+}
+
+function resRenderTrades(trades) {
+  const body = els.resTradesBody;
+  if (!body) return;
+  if (!trades || !trades.length) {
+    body.innerHTML = "";
+    return;
+  }
+  body.innerHTML = trades.map((t, i) => {
+    const win = t.pnl_r != null && t.pnl_r > 0;
+    const loss = t.pnl_r != null && t.pnl_r <= 0;
+    return `<tr>` +
+      `<td>${i + 1}</td>` +
+      `<td title="fill ${t.fill_ts ? chartNiceTime(t.fill_ts) : "—"}">${chartNiceTime(t.signal_ts)}</td>` +
+      `<td class="${t.direction === "BUY" ? "profit-pos" : "profit-neg"}">${esc(t.direction || "")}</td>` +
+      `<td>${num(t.score, 1)}</td>` +
+      `<td>${esc(t.killzone || "—")}</td>` +
+      `<td>${esc(t.entry_kind || "—")}</td>` +
+      `<td>${esc(t.status || "—")}</td>` +
+      `<td>${t.entry_price != null ? num(t.entry_price, 5) : "—"}</td>` +
+      `<td>${t.exit_price != null ? num(t.exit_price, 5) : "—"}</td>` +
+      `<td>${esc(t.exit_reason || "—")}</td>` +
+      `<td class="${win ? "profit-pos" : loss ? "profit-neg" : ""}">${t.pnl_r != null ? num(t.pnl_r, 2) + "R" : "—"}</td>` +
+    `</tr>`;
+  }).join("");
+  body.querySelectorAll("tr").forEach((tr, i) => {
+    tr.title = "Audit en el gráfico principal";
+    tr.addEventListener("click", () => auditTrade(trades[i], resSaved));
+  });
+}
+
+function resRender(data, kind) {
+  if (!data || kind === "export") return;
+  els.resResults.hidden = data.error ? true : false;
+  if (data.error) { resShowError(data.error); return; }
+  resSaved = data.saved || null;
+  resLast = { data, kind };
+  resShowStatus(kind, data);
+  if (kind !== "search") { if (els.resSearch) els.resSearch.innerHTML = ""; }
+  if (kind === "validate") {
+    const checks = data.checks || {};
+    const rows = Object.entries(checks)
+      .map(([k, v]) => `<div class="res-warn" style="border-color:${v ? "rgba(46,230,168,0.35)" : "rgba(255,93,108,0.4)"};color:${v ? "var(--green)" : "var(--red)"}">${v ? "✔" : "✘"} ${esc(k)}</div>`)
+      .join("");
+    els.resKpis.innerHTML = rows || `<div class="res-warn">Sin checks.</div>`;
+    els.resSuggestions.innerHTML = (data.warnings || []).length
+      ? `<div class="res-suggest-head">Advertencias</div>` +
+        data.warnings.map((w) => `<div class="res-warn">⚠ ${esc(w)}</div>`).join("")
+      : "";
+    els.resBreakdown.innerHTML = "";
+    els.resTradesBody.innerHTML = "";
+    if (els.resPlotTitle) { /* no equity para validate */ }
+    if (resChartObj) { resChartObj.dispose(); resChartObj = null; }
+    return;
+  }
+  if (kind === "search") {
+    if (resChartObj) { resChartObj.dispose(); resChartObj = null; }
+    els.resKpis.innerHTML = [
+      resKpi("Combinaciones", num(data.combos, 0)),
+      resKpi("Mejores", num((data.results || []).length, 0)),
+      resKpi("Min. fills", num(data.min_filled, 0)),
+      resKpi("Determinista", "sí", "profit-pos"),
+    ].join("");
+    els.resSuggestions.innerHTML = `<div class="res-warn">La búsqueda solo ordena resultados: nada se ha escrito en strategy.yaml.</div>`;
+    els.resBreakdown.innerHTML = "";
+    els.resTradesBody.innerHTML = "";
+    resRenderSearch(data);
+    return;
+  }
+  const m = data.metrics || {};
+  resRenderKpis(m);
+  resRenderEquity((data.run && data.run.trades) || []);
+  resRenderSuggestions(data.suggestions, data.warnings);
+  resRenderBreakdowns(data.breakdowns);
+  resRenderTrades((data.run && data.run.trades) || []);
+}
+
+function resRenderSearch(out) {
+  const el = els.resSearch;
+  if (!el) return;
+  if (!out || !Array.isArray(out.results)) { el.innerHTML = ""; return; }
+  const baseTxt = Object.entries(out.base || {})
+    .map(([k, v]) => `<span class="apply-k">${esc(k)}</span>=${num(v, 2)}`).join(", ");
+  const head = `<div class="res-search-head">` +
+    `Barrido de ${out.combos} combinaciones → Top ${out.results.length} (min. ${out.min_filled} fills para rankear). Base: ${baseTxt}. Clic en una fila para aplicar.</div>`;
+  const rows = out.results.map((r, i) => {
+    const m = r.metrics || {};
+    const params = Object.entries(r.params || {})
+      .map(([k, v]) => `${esc(k)}=${num(v, 2)}`).join(", ");
+    return `<tr class="${i === 0 ? "rank-top" : ""}">` +
+      `<td>#${i + 1}</td>` +
+      `<td class="apply-k">${params}</td>` +
+      `<td>${m.n_filled != null ? num(m.n_filled, 0) : "—"}</td>` +
+      `<td>${m.win_rate != null ? num(m.win_rate, 1) + "%" : "—"}</td>` +
+      `<td class="${m.expectancy_r != null && m.expectancy_r >= 0 ? "profit-pos" : "profit-neg"}">${m.expectancy_r != null ? num(m.expectancy_r, 2) + "R" : "—"}</td>` +
+      `<td>${m.profit_factor != null ? num(m.profit_factor, 2) : "—"}</td>` +
+      `<td>${m.max_dd_equity_pct != null ? num(m.max_dd_equity_pct, 2) + "%" : "—"}</td>` +
+      `<td>${r.underpowered ? `<span class="res-undpw">⚠ &lt;${out.min_filled} fills</span>` : "—"}</td>` +
+      `<td>${r.rank != null ? num(r.rank, 2) : "—"}</td>` +
+      `<td><span class="res-rank-row-btn rank-btn" data-row-i="${i}">Aplicar</span></td>` +
+    `</tr>`;
+  }).join("");
+  el.innerHTML = head +
+    `<div class="table-wrap"><table class="res-rank-table"><thead><tr>` +
+    `<th>#</th><th>Config</th><th>Fills</th><th>WR</th><th>E (R)</th><th>PF</th>` +
+    `<th>DD</th><th>Nota</th><th>Rank</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  el.querySelectorAll("[data-row-i]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const row = out.results[parseInt(btn.getAttribute("data-row-i"), 10)];
+      const items = Object.entries(row.params || {})
+        .map(([k, v]) => ({ key: k, value: v, current: (out.base || {})[k] }));
+      applyOpen(items);
+    });
+  });
+}
+
+function resDigestFmt(v) {
+  if (v === null || v === undefined) return "—";
+  if (typeof v === "object") return JSON.stringify(v);
+  return num(v, 2);
+}
+
+function resExplainDigest(data, kind) {
+  if (!data) return "";
+  const d = [];
+  const sym = resResolve();
+  d.push(`Resultado de investigación · ${sym.symbol} ${sym.timeframe} · ${kind === "search" ? "Grid search (Top-N)" : kind === "calibrate" ? "Calibrar (con sugerencias)" : "Backtest"}`);
+  if (kind === "search") {
+    const ds = data.dataset || {};
+    d.push(`Dataset: ${ds.n_bars ?? "?"} velas. Base actual (strategy.yaml): ${Object.entries(data.base || {}).map(([k, v]) => `${k}=${num(v, 2)}`).join(", ")}.`);
+    d.push(`Grid: ${data.combos ?? "?"} combinaciones barridas, mínimo ${data.min_filled ?? "?"} fills para rankear.`);
+    (data.results || []).forEach((r, i) => {
+      const m = r.metrics || {};
+      const params = Object.entries(r.params || {}).map(([k, v]) => `${k}=${num(v, 2)}`).join(", ");
+      d.push(`#${i + 1} · ${params} → fills ${m.n_filled ?? "—"}, WR ${m.win_rate != null ? num(m.win_rate, 1) + "%" : "—"}, E ${m.expectancy_r != null ? num(m.expectancy_r, 2) + "R" : "—"}, PF ${m.profit_factor != null ? num(m.profit_factor, 2) : "—"}, DD ${m.max_dd_equity_pct != null ? num(m.max_dd_equity_pct, 2) + "%" : "—"}, rank ${r.rank != null ? num(r.rank, 2) : "—"}${r.underpowered ? " (⚠ muestra insuficiente)" : ""}`);
+    });
+    d.push("Nota: el grid search solo ordena resultados; no ha escrito nada en strategy.yaml.");
+    return d.join("\n");
+  }
+  const m = data.metrics || {};
+  d.push(`Nº de velas evaluadas: ${data.run && data.run.n_bars != null ? data.run.n_bars : "?"}`);
+  const fields = [
+    ["Fills ejecutados", m.n_filled, "dec0"],
+    ["Operaciones ganadas", m.wins, "dec0"],
+    ["Operaciones perdidas", m.losses, "dec0"],
+    ["Win rate", m.win_rate != null ? num(m.win_rate, 1) + "%" : null, "raw"],
+    ["Esperanza por operación", m.expectancy_r != null ? num(m.expectancy_r, 2) + "R" : null, "raw"],
+    ["Esperanza en pips", m.expectancy_pips != null ? num(m.expectancy_pips, 2) + " pips" : null, "raw"],
+    ["Ganancia media", m.avg_win_r != null ? num(m.avg_win_r, 2) + "R" : null, "raw"],
+    ["Pérdida media", m.avg_loss_r != null ? num(m.avg_loss_r, 2) + "R" : null, "raw"],
+    ["Profit factor", m.profit_factor, "dec2"],
+    ["Drawdown máximo (curva 1%/trade)", m.max_dd_equity_pct != null ? num(m.max_dd_equity_pct, 2) + "%" : null, "raw"],
+    ["Velas en espera (media)", m.avg_bars_pending, "dec0"],
+    ["Velas mantenidas (media)", m.avg_bars_held, "dec0"],
+  ];
+  fields.forEach(([label, v, f]) => {
+    if (v == null) return;
+    d.push(`${label}: ${f === "raw" ? v : f === "dec2" ? num(v, 2) : num(v, 0)}`);
+  });
+  const bd = data.breakdowns || {};
+  const breakdowns = [["Dirección", bd.by_direction], ["Killzone", bd.by_killzone], ["Tipo de entrada", bd.by_entry_kind]];
+  breakdowns.forEach(([label, sub]) => {
+    if (!sub || !Object.keys(sub).length) return;
+    d.push(`Desglose por ${label.toLowerCase()}:`);
+    Object.entries(sub).forEach(([k, mm]) => {
+      d.push(`  ${k}: ${mm.n_filled ?? "?"} fills · WR ${mm.win_rate != null ? num(mm.win_rate, 1) + "%" : "—"} · E ${mm.expectancy_r != null ? num(mm.expectancy_r, 2) + "R" : "—"}`);
+    });
+  });
+  if (kind === "calibrate") {
+    const sugg = data.suggestions || [];
+    if (sugg.length) {
+      d.push("Cambios sugeridos frente a strategy.yaml (aún NO aplicados):");
+      sugg.forEach((s) => {
+        d.push(`  ${s.path}: de ${resDigestFmt(s.current)} → ${resDigestFmt(s.suggested)} · motivo: ${s.reason} · confianza ${s.confidence != null ? s.confidence + "%" : "?"}`);
+      });
+    } else {
+      d.push("No hay cambios sugeridos: la configuración actual es la recomendada.");
+    }
+    (data.warnings || []).forEach((w) => d.push(`⚠ ${w}`));
+  }
+  return d.join("\n");
+}
+
+async function resExplain() {
+  if (!resLast || !resLast.data) {
+    toast("Primero ejecuta una investigación (Backtest, Calibrar o Buscar).", "err");
+    return;
+  }
+  const kind = resLast.kind || "backtest";
+  const digest = resExplainDigest(resLast.data, kind);
+  const msg = [
+    "Explica en lenguaje fácil, para un trader que quiere entender el resultado sin jerga técnica, esta investigación de mi estrategia de trading. Define con una frase sencilla qué significa WIN RATE, ESPERANZA (en R y en pips), PROFIT FACTOR y DRAWDOWN. Di con claridad si la configuración es buena o no, qué cambiarías y por qué, y termina con una conclusión clara y el siguiente paso que darías.",
+    "---DATOS DE LA INVESTIGACIÓN---",
+    digest,
+    "---FIN---",
+    "Responde siempre en español, con secciones cortas y ejemplos simples. No es consejo de inversión.",
+  ].join("\n");
+  sendChat(msg, { skipTools: true });
+}
+
+async function resRun(kind) {
+  resBusy(true);
+  try {
+    const res = await fetch(RES_ENDPOINTS[kind], {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(resResolve()),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || ("estado " + res.status));
+    toast(`${kind[0].toUpperCase() + kind.slice(1)} completado`, "ok");
+    resRender(data, kind);
+  } catch (err) {
+    resShowError(err.message || String(err));
+  } finally {
+    resBusy(false);
+  }
+}
+
+/* ---- Aplicar diff a strategy.yaml (Fase 2, con confirmación) ---- */
+let applyPending = null;
+
+function applyOpen(items) {
+  applyPending = items;
+  if (els.applyResult) {
+    els.applyResult.hidden = true;
+    els.applyResult.textContent = "";
+  }
+  els.applyList.innerHTML = (items || []).map((it) =>
+    `<div class="apply-diff-row"><span class="apply-k">${esc(it.key)}</span>` +
+    `<span class="apply-v">${it.current != null ? resSugVal(it.current) + " → " : ""}<b>${resSugVal(it.value)}</b></span></div>`
+  ).join("") || `<div class="res-warn">Sin cambios.</div>`;
+  els.applyModal.hidden = false;
+}
+
+function applyCloseModal() {
+  els.applyModal.hidden = true;
+  applyPending = null;
+}
+
+async function applyRun() {
+  if (!applyPending || !applyPending.length) return;
+  els.applyConfirm.disabled = true;
+  try {
+    const res = await fetch("/api/research/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        updates: applyPending.map((it) => ({ key: it.key, value: it.value })),
+        ...resResolve(),
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || ("estado " + res.status));
+    const m = (data.after_payload && data.after_payload.metrics) || {};
+    const applySummary = `Backtest con la config nueva: ${m.n_filled != null ? m.n_filled : "?"} fills · ` +
+      `WR ${m.win_rate != null ? num(m.win_rate, 1) + "%" : "—"} · ` +
+      `E ${m.expectancy_r != null ? num(m.expectancy_r, 2) + "R" : "—"} · ` +
+      `DD ${m.max_dd_equity_pct != null ? num(m.max_dd_equity_pct, 2) + "%" : "—"}`;
+    if (data.after_payload) {
+      resRender({
+        run: data.after_payload.run,
+        metrics: data.after_payload.metrics,
+        breakdowns: data.after_payload.breakdowns,
+        suggestions: [],
+        warnings: [],
+        saved: data.saved,
+      }, "backtest");
+    }
+    toast(`Config aplicada (${Object.keys(data.after_config || {}).length} cambios)`, "ok");
+    els.applyList.innerHTML = `<div class="res-warn" style="border-color:rgba(46,230,168,0.35);color:var(--green)">` +
+      `Config aplicada y guardada.<br/>Backup: <code>${esc(data.backup_path || "—")}</code><br/>${esc(applySummary)}</div>`;
+    els.applyBackupNote.innerHTML =
+      "Puedes revertir con `git checkout strategy.yaml` o restaurar la copia de backups/.";
+    applyCloseModal();
+  } catch (err) {
+    els.applyResult.hidden = false;
+    els.applyResult.textContent = "Error al aplicar: " + (err.message || String(err));
+    els.applyConfirm.disabled = false;
+  }
+}
+
+/* ---- Audit de un trade simulado en el gráfico (Fase 4) ---- */
+let auditActive = false;
+let auditPrevTf = "M15";
+let auditPrevPattern = null;
+let auditPrevOverlay = null;
+
+function auditTrade(trade, saved) {
+  if (!trade || !saved) return;
+  auditPrevTf = chartState.tf;
+  auditPrevOverlay = {
+    markLine: SETUP_OVERLAY.markLine.slice(),
+    markPoint: SETUP_OVERLAY.markPoint.slice(),
+  };
+  auditPrevPattern = lastPatternData;
+  els.auditExitBtn.disabled = true;
+  fetch("/api/research/audit", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      saved,
+      signal_ts: trade.signal_ts,
+      window_before: 120,
+      window_after: 80,
+    }),
+  })
+    .then((r) => r.json().then((d) => ({ ok: r.ok, d })))
+    .then(({ ok, d }) => {
+      if (!ok) throw new Error((d && d.error) || "estado " + r.status);
+      renderAudit(d);
+    })
+    .catch((err) => {
+      toast("Audit: " + (err.message || String(err)), "err");
+      lastPatternData = auditPrevPattern;
+    })
+    .finally(() => {
+      els.auditExitBtn.disabled = false;
+    });
+}
+
+function renderAudit(d) {
+  if (!d || !Array.isArray(d.candles) || !d.candles.length) {
+    toast("Audit sin velas para dibujar.", "err");
+    return;
+  }
+  auditActive = true;
+  chartState.symbol = d.symbol;
+  chartState.tf = d.timeframe || auditPrevTf;
+  lastCandles = d.candles;
+  chartIndexMap.clear();
+  chartSyncData();
+
+  const zone = d.zone || null;
+  const patterns = { fvgs: [], order_blocks: [], sweeps: [] };
+  if (zone) {
+    if (zone.type && zone.type.indexOf("_FVG") !== -1) patterns.fvgs = [zone];
+    else patterns.order_blocks = [zone];
+  }
+  setPatternZones({ patterns, pdh: null, pdl: null });
+
+  const t = d.trade || {};
+  const plan = t.plan || {};
+  const markLine = [];
+  if (plan.entry != null) {
+    markLine.push({
+      yAxis: plan.entry,
+      lineStyle: { color: "#58a6ff", width: 1, type: "dashed" },
+      label: { show: true, formatter: "Entry", color: "#58a6ff", fontSize: 10, position: "insideEndTop" },
+    });
+  }
+  if (plan.sl != null) {
+    markLine.push({
+      yAxis: plan.sl,
+      lineStyle: { color: "#ff5d6c", width: 1, type: "dotted" },
+      label: { show: true, formatter: "SL", color: "#ff5d6c", fontSize: 10, position: "insideEndTop" },
+    });
+  }
+  if (plan.tp != null) {
+    markLine.push({
+      yAxis: plan.tp,
+      lineStyle: { color: "#2ee6a8", width: 1, type: "dotted" },
+      label: { show: true, formatter: "TP", color: "#2ee6a8", fontSize: 10, position: "insideEndTop" },
+    });
+  }
+  if (plan.invalidate != null) {
+    markLine.push({
+      yAxis: plan.invalidate,
+      lineStyle: { color: "rgba(255,179,0,0.8)", width: 1, type: "dashed" },
+      label: { show: true, formatter: "Invalidate", color: "#ffb300", fontSize: 10, position: "insideEndBottom" },
+    });
+  }
+  SETUP_OVERLAY.markLine = markLine;
+  SETUP_OVERLAY.markPoint = [];
+  redrawPatterns();
+
+  const step = d.tf_sec || 900;
+  const markPoint = [];
+  if (t.signal_ts != null) {
+    markPoint.push({
+      coord: [t.signal_ts, plan.entry],
+      value: "S", symbol: "circle", symbolSize: 12,
+      itemStyle: { color: "#ffffff", borderColor: "#58a6ff", borderWidth: 2 },
+      label: { show: false },
+    });
+  }
+  if (t.fill_ts != null) {
+    markPoint.push({
+      coord: [t.fill_ts + step * 0.5, plan.entry],
+      value: "F", symbol: "triangle", symbolSize: 11,
+      itemStyle: { color: "#58a6ff" }, label: { show: false },
+    });
+  }
+  if (t.exit_ts != null && t.exit_price != null) {
+    markPoint.push({
+      coord: [t.exit_ts + step * 1.0, t.exit_price],
+      value: "X", symbol: "cross", symbolSize: 12,
+      itemStyle: { color: t.pnl_r > 0 ? "#2ee6a8" : "#ff5d6c" }, label: { show: false },
+    });
+  }
+  chart.setOption({ series: [{ id: "candles", markPoint: { silent: true, data: markPoint } }] });
+
+  const lo = Math.min.apply(null, d.candles.map((c) => c.low));
+  const hi = Math.max.apply(null, d.candles.map((c) => c.high));
+  focusChartView({
+    start_time: d.candles[0].time,
+    end_time: d.candles[d.candles.length - 1].time,
+    price_min: lo,
+    price_max: hi,
+  });
+
+  els.auditTitle.textContent =
+    `AUDIT ${d.symbol} ${d.timeframe} · ${t.status || "?"} · ` +
+    `${t.entry_kind || "—"} · ${t.direction || "—"} · #${t.id != null ? t.id : "—"}`;
+  els.auditPlan.textContent =
+    `score ${t.score != null ? num(t.score, 1) : "—"} · ` +
+    `Entry ${plan.entry != null ? num(plan.entry, 5) : "—"} · ` +
+    `SL ${plan.sl != null ? num(plan.sl, 5) : "—"} · ` +
+    `TP ${plan.tp != null ? num(plan.tp, 5) : "—"} · ` +
+    `Fill ${t.fill_ts ? chartNiceTime(t.fill_ts) : "—"} · ` +
+    `Exit ${t.exit_ts ? chartNiceTime(t.exit_ts) : "—"} · ` +
+    `PnL ${t.pnl_r != null ? num(t.pnl_r, 2) + "R" : "—"}`;
+  els.auditBanner.hidden = false;
+  toast("Audit dibujado en el gráfico principal (investigación). Usa «volver a vivo» para salir.", "ok");
+}
+
+function exitAudit() {
+  auditActive = false;
+  SETUP_OVERLAY.markLine = auditPrevOverlay ? auditPrevOverlay.markLine : [];
+  SETUP_OVERLAY.markPoint = auditPrevOverlay ? auditPrevOverlay.markPoint : [];
+  lastPatternData = auditPrevPattern;
+  chartState.tf = auditPrevTf;
+  els.auditBanner.hidden = true;
+  loadCandles(false);
+}
+
+els.resExportBtn.addEventListener("click", () => resRun("export"));
+els.resValidateBtn.addEventListener("click", () => resRun("validate"));
+els.resBacktestBtn.addEventListener("click", () => resRun("backtest"));
+els.resCalibrateBtn.addEventListener("click", () => resRun("calibrate"));
+els.resSearchBtn.addEventListener("click", () => resRun("search"));
+els.resExplainBtn.addEventListener("click", resExplain);
+
+els.applyClose.addEventListener("click", applyCloseModal);
+els.applyCancel.addEventListener("click", applyCloseModal);
+els.applyModal.addEventListener("click", (e) => {
+  if (e.target === els.applyModal) applyCloseModal();
+});
+els.applyConfirm.addEventListener("click", applyRun);
+els.auditExitBtn.addEventListener("click", exitAudit);
+
 /* ---- Wiring ---- */
 els.tradeBuyBtn.addEventListener("click", () => openTradeModal("BUY"));
 els.tradeSellBtn.addEventListener("click", () => openTradeModal("SELL"));
@@ -2703,6 +4312,15 @@ els.posTable.addEventListener("click", (e) => {
   const b = e.target.closest("button[data-ticket]");
   if (b) askClose(+b.dataset.ticket);
 });
+
+/* Chartismo clásico: botones toggle de capas + limpiar solo figuras ci */
+document.querySelectorAll("#drawTools [data-kind]").forEach((b) => {
+  b.addEventListener("click", () => toggleChartism(b.dataset.kind));
+});
+const dtChartismClear = document.getElementById("dtChartismClear");
+if (dtChartismClear) {
+  dtChartismClear.addEventListener("click", clearChartism);
+}
 els.closeConfirm.addEventListener("click", confirmClose);
 els.closeCancel.addEventListener("click", () => {
   els.closeModal.hidden = true;

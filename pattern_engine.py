@@ -116,6 +116,7 @@ def detect_order_blocks(candles: List[dict]) -> List[dict]:
     highs, lows = _swing_pivots(candles)
     last_sh = None  # (precio, índice) del último swing high confirmado
     last_sl = None  # (precio, índice) del último swing low confirmado
+    seen_obs: set = set()  # evita repetir el mismo OB en cada candle de BOS
 
     hi_p, lo_p = 0, 0
     for i in range(max(_BOS_WINDOW, 1), n):
@@ -131,12 +132,14 @@ def detect_order_blocks(candles: List[dict]) -> List[dict]:
 
         if last_sh and candles[i]["close"] > last_sh[0]:
             ob_idx = _last_opposite_candle(candles, i, _BOS_WINDOW, up=True)
-            if ob_idx is not None:
+            if ob_idx is not None and ob_idx not in seen_obs:
                 _append_active_ob(out, candles, ob_idx, i, BULLISH_OB)
+                seen_obs.add(ob_idx)
         elif last_sl and candles[i]["close"] < last_sl[0]:
             ob_idx = _last_opposite_candle(candles, i, _BOS_WINDOW, up=False)
-            if ob_idx is not None:
+            if ob_idx is not None and ob_idx not in seen_obs:
                 _append_active_ob(out, candles, ob_idx, i, BEARISH_OB)
+                seen_obs.add(ob_idx)
     return out
 
 

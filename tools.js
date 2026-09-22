@@ -16,6 +16,7 @@
   var TOOLS = ["cursor", "line", "hline", "rect", "measure", "text", "delete"];
 
   function pickColor(it) {
+    if (it.origin === "chartism") return "#58a6ff";
     if (it.tool === "hline") return "#c084fc";
     if (it.tool === "rect") return "#58a6ff";
     if (it.tool === "measure") return "#ffb300";
@@ -328,7 +329,8 @@
         for (var i = 0; i < list.length && items.length < 120; i++) {
           var it = list[i];
           if (!it || !it.tool) continue;
-          items.push({ id: it.id || mkId(), origin: it.origin === "agent" ? "agent" : "user", tool: it.tool, t0: it.t0, p0: it.p0, t1: it.t1, p1: it.p1, text: it.text || "" });
+          var origin = it.origin === "user" ? "user" : it.origin === "agent" ? "agent" : "chartism";
+          items.push({ id: it.id || mkId(), origin: origin, tool: it.tool, t0: it.t0, p0: it.p0, t1: it.t1, p1: it.p1, text: it.text || "", group: it.group && typeof it.group === "string" ? it.group : undefined });
         }
         selectedId = null;
         renderNow();
@@ -346,8 +348,9 @@
     scheduleSave();
   }
 
-  function addAgentDrawings(draws) {
+  function addAgentDrawings(draws, origin) {
     if (!Array.isArray(draws) || !draws.length || !chart) return;
+    origin = origin === "chartism" ? "chartism" : "agent";
     var map = new Map();
     items.forEach(function (it) {
       map.set(it.id, it);
@@ -358,17 +361,42 @@
       var id = raw.id || mkId();
       map.set(id, {
         id: id,
-        origin: "agent",
+        origin: origin,
         tool: raw.tool,
         t0: raw.t0 != null ? raw.t0 : null,
         p0: raw.p0,
         t1: raw.t1 != null ? raw.t1 : null,
         p1: raw.p1 != null ? raw.p1 : null,
         text: raw.text || "",
+        group: raw.group && typeof raw.group === "string" ? raw.group : undefined,
       });
     });
     items = Array.from(map.values());
     if (items.length > 120) items = items.slice(items.length - 120);
+    renderNow();
+    scheduleSave();
+  }
+
+  function removeByGroup(group) {
+    if (!group) return;
+    var before = items.length;
+    items = items.filter(function (it) {
+      return !(it.origin === "chartism" && it.group === group);
+    });
+    if (items.length === before) return;
+    if (selectedId) selectedId = null;
+    renderNow();
+    scheduleSave();
+  }
+
+  function removeByOrigin(origin) {
+    if (!origin) return;
+    var before = items.length;
+    items = items.filter(function (it) {
+      return it.origin !== origin;
+    });
+    if (items.length === before) return;
+    if (selectedId) selectedId = null;
     renderNow();
     scheduleSave();
   }
@@ -727,6 +755,8 @@
     onBars: onBars,
     reload: reload,
     addAgentDrawings: addAgentDrawings,
+    removeByGroup: removeByGroup,
+    removeByOrigin: removeByOrigin,
     setTool: setTool,
   };
 })();

@@ -15,7 +15,7 @@ execution:
 score:
   min_score: 70.0
   min_rr: 2.0
-  setup_ttl_minutes: 40.0
+  setup_ttl_minutes: 20
   weights:
     cot: 0.0
     cvd_of: 20.0

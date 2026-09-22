@@ -84,6 +84,7 @@ def _fetch(symbol: str, timeframe: str, bars: int):
         raise ValueError(f"Timeframe '{timeframe}' no válido. Usa M1..M30, H1, H4, D1 o W1.")
 
     def _get():
+        mt5.symbol_select(symbol, True)
         intraday = mt5.copy_rates_from_pos(symbol, tf, 0, max(10, min(bars, 1000)))
         d1 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_D1, 0, 3)
         return intraday, d1
@@ -107,6 +108,23 @@ def _fetch(symbol: str, timeframe: str, bars: int):
     return {"candles": candles, "pdh": pdh, "pdl": pdl}
 
 
+_PROVIDER = None
+
+
+def register_provider(fn) -> None:
+    """Registra un proveedor alternativo de velas/datos para get_pattern_data.
+
+    Cuando está registrado y devuelve datos (no None), get_pattern_data lo usa
+    ANTES de tocar MT5. app.py lo registra apuntando al MarketSimulator para que
+    tool del agente, bitácora y endpoints que no hacen su propio branching se
+    alimenten de la cinta sintética cuando el feed mock 6E está activo. fn es
+    puro (no importa app): se inyecta una lambda. Devuelve None pa filtrarse a
+    MT5 (mantiene el fallback histórico).
+    """
+    global _PROVIDER
+    _PROVIDER = fn
+
+
 def get_pattern_data(symbol: str, timeframe: str = DEFAULT_TIMEFRAME,
                      bars: int = DEFAULT_BARS) -> Optional[dict]:
     """Datos de patrones con caché TTL. Devuelve {"candles", "pdh", "pdl", "analysis"}
@@ -121,9 +139,15 @@ def get_pattern_data(symbol: str, timeframe: str = DEFAULT_TIMEFRAME,
         if hit and now - hit["ts"] < CACHE_TTL:
             return hit["data"]
 
-    data = _fetch(symbol, tf, bars)
-    if data is None:
-        return None
+    provider = _PROVIDER
+    if provider is not None:
+        data = provider(symbol, tf, bars)
+        if data is None:
+            return None
+    else:
+        data = _fetch(symbol, tf, bars)
+        if data is None:
+            return None
 
     data["analysis"] = pe.analyze(
         data["candles"], data["pdh"], data["pdl"], symbol=symbol, timeframe=tf

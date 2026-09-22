@@ -92,6 +92,22 @@
                 title="Evaluar setup determinista (sin IA): score + Entry/SL/TP"
                 data-tip="Calcula score de setup con risk_engine y dibuja bandera Entry + líneas SL/TP si el score alcanza el mínimo configurado (strategy.yaml)"
               >⚡ Calcular Setup</button>
+              <div class="chart-mode-group" id="chartMode" title="Tipo de gráfico a analizar">
+                <button type="button" data-mode="classic" class="active" title="Velas + SMC + CVD + VP (vista estándar)">Clásico</button>
+                <button type="button" data-mode="footprint" title="Footprint / Cluster Chart: agresión bid vs ask por nivel de precio [SINTÉTICO]">Footprint</button>
+                <button type="button" data-mode="heatmap" title="Heatmap de liquidez: pseudo-DOM con órdenes límite sintéticas [SINTÉTICO]">Liquidez</button>
+                <button type="button" data-mode="vp" title="Perfil de Volumen: PoC, VAH/VAL y delta por nivel">Vol. Profile</button>
+                <button type="button" data-mode="event" title="Barras por evento: volbar / tickbar / renko [SINTÉTICO]">Event Bars</button>
+              </div>
+              <span class="source-chip" id="sourceChip" title="Origen de los datos del gráfico activo. Será DATABENTO 6E cuando el feed real esté activo.">fuente: SINTÉTICO MT5</span>
+              <div class="ev-controls" id="evControls" hidden>
+                <select id="evMode" class="role-select" title="Tipo de barra por evento">
+                  <option value="volbar">Volbar</option>
+                  <option value="tickbar">Tickbar</option>
+                  <option value="renko">Renko</option>
+                </select>
+                <input id="evParam" class="sym-input ev-param" type="number" min="1" value="500" step="1" title="Parámetro: volumen objetivo (volbar), nº de ticks (tickbar) o pasos de precio (renko)" spellcheck="false">
+              </div>
               <div class="tf-group" id="tfGroup">
                 <button type="button" data-tf="M1">M1</button>
                 <button type="button" data-tf="M5">M5</button>
@@ -171,9 +187,108 @@
                   <path d="M6 6l12 12M18 6L6 18"/>
                 </svg>
               </button>
+              <span class="dt-sep"></span>
+              <span class="dt-group-label" title="Detección automática de patrones chartistas (se guardan por símbolo/timeframe)">CI</span>
+              <button type="button" class="dt-btn" data-kind="trend" title="Canal / líneas de tendencia (detección automática)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M4 16L20 8"/>
+                  <path d="M4 20L16 13"/>
+                </svg>
+              </button>
+              <button type="button" class="dt-btn" data-kind="triangle" title="Triángulo ascendente/descendente/simétrico (detección automática)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 4L20 19H4Z"/>
+                </svg>
+              </button>
+              <button type="button" class="dt-btn" data-kind="flag" title="Bandera / banderín (detección automática)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M5 3v18"/>
+                  <path d="M5 5l13-3v9l-13 3"/>
+                </svg>
+              </button>
+              <button type="button" class="dt-btn" data-kind="double" title="Doble techo / doble suelo (detección automática)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M2 18L8 9L12 14L17 7L22 12"/>
+                </svg>
+              </button>
+              <button type="button" class="dt-btn" data-kind="hns" title="Cabeza y hombros / H&S invertido (detección automática)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M2 18L6 9L9 16L12 5L15 16L18 9L22 18"/>
+                </svg>
+              </button>
+              <button type="button" class="dt-btn danger" id="dtChartismClear" title="Limpiar todas las figuras de chartismo (deja los dibujos manuales)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="9"/>
+                  <path d="M5.6 5.6L18.4 18.4M8.5 12h7"/>
+                </svg>
+              </button>
               <span class="draw-hint" id="drawHint"></span>
             </div>
+            <div class="audit-banner" id="auditBanner" hidden>
+              <span class="audit-title" id="auditTitle"></span>
+              <span class="audit-plan" id="auditPlan"></span>
+              <button type="button" class="btn btn-confirm" id="auditExit" title="Recargar el gráfico en vivo del símbolo original">volver a vivo</button>
+            </div>
             <div id="chart"></div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <header class="panel-head">
+            <h2>Investigación / Backtest <span class="res-badge" id="resBadge" title="Pipeline research/ (offline, separado del runtime)">offline</span></h2>
+            <div class="panel-actions res-controls">
+              <input id="resSymbol" class="sym-input" type="text" value="EURUSD" placeholder="Símbolo" spellcheck="false">
+              <select id="resTf" class="role-select" title="Timeframe">
+                <option value="M1">M1</option>
+                <option value="M5">M5</option>
+                <option value="M15" selected>M15</option>
+                <option value="M30">M30</option>
+                <option value="H1">H1</option>
+                <option value="H4">H4</option>
+                <option value="D1">D1</option>
+                <option value="W1">W1</option>
+              </select>
+              <input id="resDays" class="sym-input res-days" type="number" min="1" max="365" value="90" title="Ventana en días">
+              <button type="button" class="btn" id="resExportBtn" title="Re-exporta el histórico desde MT5 a research/data/">Exportar</button>
+              <button type="button" class="btn" id="resValidateBtn" title="Integridad + no-look-ahead del dataset">Validar</button>
+              <button type="button" class="btn" id="resBacktestBtn" title="Simula el gate del watcher sobre el histórico y calcula métricas">Backtest</button>
+              <button type="button" class="btn btn-confirm" id="resCalibrateBtn" title="Backtest + diff sugerido contra strategy.yaml (nunca escribe)">Calibrar</button>
+              <button type="button" class="btn" id="resSearchBtn" title="Grid search: barre variaciones y te da el Top-N. Calcula, nunca escribe">Buscar</button>
+              <button type="button" class="btn" id="resExplainBtn" title="Pide al agente AI que explique el último resultado en lenguaje fácil (responde en el chat)">🤖 Explicar</button>
+              <span class="updated" id="resUpdated"></span>
+            </div>
+          </header>
+          <div class="res-status res-info" id="resStatus" hidden></div>
+          <div class="res-results" id="resResults" hidden>
+            <div class="res-kpis" id="resKpis"></div>
+            <div class="res-plot">
+              <div class="res-plot-title" id="resPlotTitle">Curva de capital (sizing 1%)</div>
+              <div id="resChart"></div>
+            </div>
+            <div id="resSuggestions"></div>
+            <div class="res-search" id="resSearch"></div>
+            <div id="resBreakdown"></div>
+            <div class="res-table-title">Operaciones simuladas</div>
+            <div class="table-wrap">
+              <table id="resTradesTable">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Señal (UTC)</th>
+                    <th>Dir</th>
+                    <th>Score</th>
+                    <th>Killzone</th>
+                    <th>Entrada</th>
+                    <th>Estado</th>
+                    <th>Entry</th>
+                    <th>Exit</th>
+                    <th>Motivo</th>
+                    <th>PnL (R)</th>
+                  </tr>
+                </thead>
+                <tbody id="resTradesBody"></tbody>
+              </table>
+            </div>
           </div>
         </section>
 
@@ -182,8 +297,18 @@
             <div class="of-title">
               <h2>Order Flow · 6E</h2>
               <span class="of-conn" id="ofConn"><span class="dot"></span><span>apagado</span></span>
+              <span class="source-chip of-source-chip" id="ofSourceChip" title="Origen actual del feed 6E">fuente: --</span>
             </div>
             <div class="panel-actions">
+              <div class="of-controls" id="ofControls">
+                <select id="ofSource" class="role-select" title="Fuente del feed Order Flow">
+                  <option value="mock" selected>Mock (sintético)</option>
+                  <option value="live">Live (Databento)</option>
+                </select>
+                <select id="ofFixture" class="role-select" title="Escenario mock" hidden>
+                  <option value="">— escenario —</option>
+                </select>
+              </div>
               <label class="switch" title="Conectar / desconectar el feed de Databento 6E">
                 <input type="checkbox" id="feedToggle">
                 <span class="slider"></span>
@@ -553,10 +678,31 @@
     </div>
   </div>
 
+  <div class="modal-overlay" id="applyModal" hidden>
+    <div class="modal">
+      <header class="modal-head">
+        <h3>Aplicar cambios a strategy.yaml</h3>
+        <button type="button" class="btn-mini" id="applyClose" title="Cerrar">✕</button>
+      </header>
+      <div class="modal-body">
+        <p class="trade-note" id="applyBackupNote">
+          Se hará una copia de strategy.yaml en <code>backups/</code> antes de escribir.
+          Después se re-corre el backtest con la config nueva para comparar.
+        </p>
+        <div id="applyList" class="strategy-rules"></div>
+        <p class="trade-note" id="applyResult" hidden></p>
+      </div>
+      <footer class="modal-foot">
+        <button type="button" class="btn" id="applyCancel">Cancelar</button>
+        <button type="button" class="btn btn-confirm" id="applyConfirm">Aplicar con confirmación</button>
+      </footer>
+    </div>
+  </div>
+
   <div class="toast" id="toast" hidden></div>
 
 <script src="/static/echarts.min.js"></script>
-<script src="/static/tools.js?v=8"></script>
-  <script src="/static/main.js?v=19"></script>
+<script src="/static/tools.js?v=10"></script>
+<script src="/static/main.js?v=24"></script>
 </body>
 </html>

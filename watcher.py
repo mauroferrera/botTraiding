@@ -192,6 +192,15 @@ def decide_transition(prev_row, gate_ok: bool, now: Optional[datetime] = None,
             return "closed"
         return None  # silencioso: mismo setup, ya avisado
 
+    # Setup bloqueado por noticia: dedup como "active" pero sin re-notificar.
+    # Se cierra cuando la señal muere o expira (nunca revive en mitad de la
+    # ventana de blackout ya registrada).
+    if status == "news_ignored":
+        created = _parse_ts(_row_value(prev_row, "created_at"))
+        expired = created is not None and ttl_sec > 0 and (
+            now - created).total_seconds() > ttl_sec
+        return "closed" if not gate_ok or expired else None
+
     # Ya ejecutado: espera a que la señal muera para cerrar el ciclo y permitir
     # un ciclo nuevo (nunca re-ejecuta mientras el setup siga vivo).
     if status == "executed":
@@ -212,6 +221,7 @@ def _default_io() -> Dict[str, Callable]:
         "new_setup_state": store.new_setup_state,
         "update_setup_state": store.update_setup_state,
         "get_auto_execute": store.get_watcher_auto_execute,
+        "log_setup": store.log_setup,
     }
 
 
@@ -266,6 +276,50 @@ def scan_once(snapshot_builder: Callable,
             continue
 
         prev = io["get_setup_state"](symbol, timeframe)
+
+        base = {"symbol": symbol, "timeframe": timeframe,
+                "direction": gate["direction"], "score": gate["score"]}
+
+        # Gate de noticias (News Blackout): con un setup aprobado pero en ventana
+        # de noticia, se registra "Ignorado por Noticia" y NO se notifica ni se
+        # ejecuta. Dedup por estado para no re-log cada ciclo de escaneo.
+        news = None
+        news_gate = io.get("news_gate")
+        if gate["approved"] and news_gate is not None:
+            try:
+                news = news_gate()
+            except Exception as exc:  # pragma: no cover - defensivo
+                news = {"ok": True, "fail_open": True, "reason": str(exc), "event": None}
+        prev_status = (_row_value(prev, "status") or "").lower()
+
+        if gate["approved"] and news is not None and not news.get("ok"):
+            if prev_status != "news_ignored":
+                try:
+                    io["log_setup"]({
+                        "symbol": symbol, "timeframe": timeframe,
+                        "direction": gate["direction"],
+                        "verdict": "IGNORED_NEWS",
+                        "score": gate["score"],
+                        "breakdown": {"gate": gate, "news": news},
+                        "entry": gate["entry"], "sl": gate["sl"], "target": gate["tp"],
+                        "invalidate_level": gate.get("invalidate_level"),
+                        "validated": False,
+                        "reject_reasons": [
+                            "BLOCKED_BY_NEWS_GATE: " + str(news.get("reason"))
+                        ],
+                        "risk_state": {}, "trade_result": {},
+                    })
+                except Exception:  # pragma: no cover - nunca romper el scan
+                    pass
+                io["new_setup_state"](symbol, timeframe, gate=gate,
+                                      status="news_ignored", notified=False)
+                payload = {**base, "killzone": gate["killzone_name"],
+                           "reason": str(news.get("reason")),
+                           "news": news.get("event")}
+                events.append({"event": "ignored_news", **payload})
+                _emit(broadcast, "strategy_setup", {**payload, "type": "ignored_news"})
+            continue
+
         transition = decide_transition(prev, gate["approved"], now=now, ttl_sec=ttl_sec)
 
         base = {"symbol": symbol, "timeframe": timeframe,
@@ -318,14 +372,15 @@ def scan_once(snapshot_builder: Callable,
 
 async def strategy_watcher(snapshot_builder: Optional[Callable] = None,
                            executor: Optional[Callable] = None,
-                           broadcast: Optional[Callable] = None):
+                           broadcast: Optional[Callable] = None,
+                           io: Optional[Dict[str, Callable]] = None):
     """Bucle del bot a la escucha. Relee la config cada ciclo (la caché de
     strategy.yaml se invalida con save()) y respeta 'watcher.enabled'."""
     while True:
         try:
             wcfg = store.get_watcher_config()
             if wcfg.get("enabled") and snapshot_builder is not None:
-                scan_once(snapshot_builder, executor=executor, broadcast=broadcast)
+                scan_once(snapshot_builder, executor=executor, broadcast=broadcast, io=io)
         except Exception:
             log.exception("error en el ciclo del watcher")
         interval = float((store.get_watcher_config() or {}).get("scan_interval_sec") or 60.0)

@@ -7,6 +7,8 @@
 trading.db
 trading.db-*
 mt5_status.json
+.dxy_cache.json
+.dxy_cache.json.tmp
 
 # Logs
 *.log
@@ -21,6 +23,11 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+
+# Pipeline de research (offline): datos exportados, resultados y reportes
+research/data/
+research/results/
+research/reports/
 
 # IDE / SO
 .idea/

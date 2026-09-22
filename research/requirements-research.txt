@@ -1,0 +1,10 @@
+# Dependencias del pipeline de research (offline/backtesting/calibración).
+# El RUNTIME no usa este archivo: app.py/agent.py/watcher.py no importan research/.
+#
+# Obligatorias: ya cubiertas por requirements.txt del proyecto
+#   - numpy  (velas OHLC y matemática del backtester)
+#   - PyYAML (lectura de strategy.yaml para la config en estudio)
+#
+# Opcionales (import guardado dentro del pipeline, nunca requeridas):
+#   vectorbt          # cross-check de la señal con Portfolio.from_signals
+#                     # (versión OSS alcanza; PRO suma paralelismo y más)

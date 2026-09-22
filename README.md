@@ -17,6 +17,7 @@ Panel de control web para trading con **MetaTrader 5**, integrado con un **agent
 - [Agente de IA](#agente-de-ia)
 - [Endpoints API](#endpoints-api)
 - [Integración con AI Chart Assistant](#integración-con-ai-chart-assistant)
+- [Pipeline de research](#pipeline-de-research)
 - [Estructura del proyecto](#estructura-del-proyecto)
 - [Seguridad](#seguridad)
 
@@ -25,15 +26,21 @@ Panel de control web para trading con **MetaTrader 5**, integrado con un **agent
 ## Características
 
 - **Dashboard en tiempo real** con KPIs de cuenta MT5 (balance, equity, P&L, margen libre, nivel de margen, posiciones abiertas).
-- **Gráfico en vivo** (Lightweight Charts) con velas, CVD sincronizado y detección de patrones SMC:
+- **Gráfico en vivo** (Apache ECharts v6) con velas, CVD sincronizado y detección de patrones SMC:
   - Fair Value Gaps (FVG)
   - Order Blocks
   - Liquidity Sweeps de PDH/PDL
+- **Modos de gráfico derivados** (vistas sintéticas unificadas): Classic, Footprint (delta por nivel), Heatmap de liquidez, Volume Profile (POC/VAH/VAL) y Event Bars (volbar/tickbar/renko).
+- **Capas de chartismo** sobre el gráfico: canal/tendencia, triángulo, bandera/banderín, doble techo/suelo y cabeza y hombros.
+- **Risk Engine / Setup Score** determinista (0–100): ponderación editable COT 25% · CVD/Order Flow 25% · SMC 30% · Killzone 20%, con killzones UTC (Londres/NY), R:R mínimo, TTL del setup y veredicto ALTA/MEDIA/SIN_OPERATIVA (bloqueo de ejecución).
+- **SMR / Divergencia DXY** (Smart Money Reversal): detecta sweeps del EURUSD/6E sin confirmación del Índice del Dólar (Yahoo Finance, gratis — sin Databento).
+- **Watcher (bot a la escucha)**: escaneo automático de setups, eventos por WebSocket y auto-ejecución opcional, con alertas y drawings de gráfico persistidos.
 - **Order flow del futuro 6E (CME)** vía Databento:
   - CVD (Cumulative Volume Delta)
   - Delta por operación
   - Picos de volumen con **Z-score**
   - Detección de **absorción de liquidez**
+  - **Feed sintético (mock)** para probar el panel sin licencia Databento (selector Live/Mock + escenarios en la UI)
 - **Chatbot con agente de IA**:
   - Tool-calling con datos reales de cuenta, historial, order flow, patrones y bitácora.
   - Router multi-proveedor con fallback automático.
@@ -50,7 +57,7 @@ Panel de control web para trading con **MetaTrader 5**, integrado con un **agent
 | Capa | Tecnología |
 |---|---|
 | Backend | Python 3.12 · FastAPI · Uvicorn |
-| Frontend | HTML5 · CSS · JavaScript (vanilla) · Lightweight Charts |
+| Frontend | HTML5 · CSS · JavaScript (vanilla) · Apache ECharts v6 |
 | Base de datos | SQLite (`trading.db`) |
 | Tiempo real | WebSocket · Server-Sent Events (SSE) |
 | Integración MT5 | `MetaTrader5` API (Python) |
@@ -98,9 +105,12 @@ PyYAML==6.0.3
 numpy==2.5.2
 requests==2.34.2
 mcp==1.29.1
+yfinance==0.2.54
 ```
 
 > **Nota para Linux/macOS y entornos sin MetaTrader 5**: el paquete `MetaTrader5` solo está disponible para Windows. La aplicación arranca igual sin él, pero las funciones de cuenta/trading histórico quedan deshabilitadas (el resto — order flow, chatbot, periodos SMC — sigue funcionando).
+>
+> `yfinance` se usa para el **SMR / divergencia DXY** (Índice del Dólar DX-Y.NYB, gratis, sin Databento) y requiere salida a internet.
 
 ---
 
@@ -118,11 +128,41 @@ GEMINI_API_KEY="tu-clave"
 # ANTHROPIC_API_KEY=""
 ```
 
+Puedes configurar varias claves Gemini (`GEMINI_API_KEY`, `GEMINI_API_KEY_2`, `GEMINI_API_KEY_3`) para **rotación y backoff** ante límites de rate (429).
+
+El detector **SMR / DXY** no requiere API key: obtiene el Índice del Dólar (DX-Y.NYB) de Yahoo Finance con caché TTL.
+
 Variable de entorno opcional para el directorio de exportaciones del indicador. Si no se define, `mt5_export.py` lo detecta automáticamente en `AppData\Roaming\MetaQuotes\Terminal\<HASH>\MQL5\Files` del usuario actual:
 
 ```env
 # Sobre escribe la ruta por defecto de MQL5\Files
 MT5_FILES_DIR="C:\ruta\a\MetaQuotes\Terminal\<HASH>\MQL5\Files"
+```
+
+### Feed sintético (Mock) para el 6E
+
+Sin licencia Databento puedes validar todo el pipeline (WebSocket, KPIs, alertas, CVD, latencia) con un **feed mock 100% offline**:
+
+```env
+# Habilita el feed sintético de order flow (default 1). Con 0 se oculta el
+# selector "Mock (sintético)" en la UI y solo queda disponible el feed live.
+ORDERFLOW_ALLOW_MOCK=1
+```
+
+Cómo funciona:
+
+- En el panel **Order Flow · 6E** elige **Mock (sintético)** en el selector de fuente y un **escenario**: `noise` (normal, sin alertas), `spike` (ráfagas Z-score ≥ 2.5), `absorption` (rango estrecho con volumen alto y delta equilibrado) o `stress` (alta frecuencia, para probar latencia). Al arrancar (toggle) el feed se reinyecta en `OrderFlowEngine` igual que el live y emite los mismos payloads por el WebSocket.
+- El engine se **resetea** en cada cambio de modo/escenario (replay determinista y limpieza Live↔Mock).
+- Igualmente hay escenarios *fixture* que reproducen `.jsonl` reales (`tests/fixtures/orderflow_6e_*.jsonl`) para regresión.
+- El feed **live de Databento** queda intacto: al obtener la licencia, basta seleccionar **Live (Databento)** — no hay cambios de configuración.
+- Ver: `mock_feed.py` (módulo puro, determinista, sin dependencias de app).
+- Con el feed mock activo, las vistas de gráfico (velas, footprint, volume profile, CVD del EURUSD/6E) también salen del **simulador unificado** (`simulator.py` + `market_view.py`): el mismo tick que consume el `OrderFlowEngine` alimenta todas las vistas, de forma determinista (misma semilla → misma secuencia → mismos outputs).
+
+Pruebas del order flow:
+
+```bash
+python -m pytest tests/test_orderflow.py -v   # solo order flow / mock
+python -m pytest tests/ -q                    # suite completa
 ```
 
 ---
@@ -149,9 +189,14 @@ Navegador (index.html / main.js)
         ▼
 app.py (FastAPI)
   ├── /api/*  endpoints (cuenta, posiciones, historial, chat, trading)
-  ├── OrderFlowEngine  (métricas 6E / Databento, thread-safe)
-  ├── patterns_service  (SMC: FVG, Order Blocks, Sweeps)
-  ├── cvd_service       (cálculo de volumen delta)
+  ├── OrderFlowEngine  (métricas 6E / Databento, thread-safe) ← mock_feed.py
+  ├── patterns_service / pattern_engine  (SMC: FVG, Order Blocks, Sweeps)
+  ├── chartism_engine  (patrones chartistas: canales, triángulos, H-C-H…)
+  ├── smr_service      (SMR/divergencia DXY vía Yahoo Finance)
+  ├── cvd_service      (cálculo de volumen delta)
+  ├── risk_engine      (Setup Score, killzones, R:R, TTL, prop firm)
+  ├── watcher          (bot a la escucha + auto-ejecución)
+  ├── simulator + market_view  (vistas sintéticas unificadas 6E/EURUSD)
   └── agente IA  ──►  agent.py  ──►  litellm  ──►  proveedor LLM
                         │
                         ├── store.py  (SQLite)
@@ -161,7 +206,7 @@ app.py (FastAPI)
 ### Hilos y concurrencia
 - `ThreadPoolExecutor` dedicado (1 worker) para llamadas síncronas a **MT5**, con `sync` lock interno.
 - El `OrderFlowEngine` es **thread-safe** (usa un `threading.Lock`).
-- El agente ejecuta herramientaras en un thread separado con timeout de 4 s.
+- El agente ejecuta herramientas en un thread separado con timeout de 4 s.
 
 ---
 
@@ -188,7 +233,7 @@ Aplicación `PRAGMA`: `journal_mode=WAL`, `busy_timeout`, `foreign_keys=ON`.
 Cada rol puede tener un proveedor/modelo fijo o usar **auto** (fallback automático). El orden por defecto:
 
 ```
-openai/gpt-4o-mini  →  gemini/gemini-3.6-flash  →  anthropic/claude-3-5-haiku
+gemini/gemini-3.8-flash  →  gemini/gemini-3.5-flash
 ```
 
 Solo se usan los proveedores cuya API key esté configurada en `.env`.
@@ -230,13 +275,30 @@ Rutas principales (todas bajo `http://127.0.0.1:8000`):
 | `GET` | `/api/stream/{symbol}` | Streaming SSE del gráfico. |
 | `GET` | `/api/analysis/patterns/{symbol}` | Patrones SMC. |
 | `GET` | `/api/analysis/cvd/{symbol}` | Serie CVD. |
-| `GET` | `/api/orderflow*` | Estado/feed/config de order flow. |
+| `GET` | `/api/analysis/chartism/{symbol}` | Patrones chartistas (canal, triángulo, bandera, dobles, H-C-H). |
+| `GET` | `/api/analysis/smr/{symbol}` | SMR / divergencia DXY. |
+| `GET` | `/api/volume-profile/{symbol}` | Volume Profile (POC/VAH/VAL). |
+| `GET` | `/api/analysis/footprint/{symbol}` | Footprint (delta por nivel, sintético). |
+| `GET` | `/api/analysis/heatmap/{symbol}` | Heatmap de liquidez (sintético). |
+| `GET` | `/api/analysis/eventbars/{symbol}` | Event bars (volbar/tickbar/renko). |
+| `GET` | `/api/analysis/chart-assistant/{symbol}` | Snapshot para el AI Chart Assistant. |
+| `GET` | `/api/orderflow` | Snapshot del order flow (CVD, delta, alertas). |
+| `GET/POST` | `/api/orderflow/feed` | Estado/control del feed (`action`, `mode`, `fixture`). |
+| `GET` | `/api/orderflow/fixtures` | Escenarios disponibles para el feed mock. |
+| `POST` | `/api/orderflow/settings` | Ajustes de Z-score / ventana de absorción. |
+| `GET` | `/api/orderflow/cvd?since=` | Serie CVD histórica del 6E. |
 | `WS`  | `/ws/orderflow` | WebSocket del order flow. |
+| `GET/POST` | `/api/cot/report` · `/api/cot/refresh` | Informe COT (CFTC) y refresco. |
+| `GET` | `/api/risk/setup` | Setup Score + breakdown de componentes. |
+| `GET` | `/api/risk/audit` | Auditoría win-rate por componente del score. |
+| `GET/DELETE` | `/api/chart/alerts*` | Alertas de gráfico persistidas. |
+| `GET/PUT/DELETE` | `/api/chart/drawings*` | Drawings del gráfico (líneas/niveles). |
+| `GET` | `/api/chart/setup-eval` | Evaluación del setup actual. |
 | `POST` | `/api/agent/message` | Envío de mensaje al agente (SSE). |
 | `GET/POST/PUT/DELETE` | `/api/agent/roles*` | Gestión de roles. |
 | `GET/POST/DELETE` | `/api/agent/conversations*` | Gestión de conversaciones. |
 | `GET` | `/api/agent/config` | Config del agente. |
-| `GET/POST/PUT/DELETE` | `/api/journal*` | Bitácora. |
+| `GET/POST/PUT/DELETE` | `/api/journal*` | Bitácora (más `/api/journal/overlay`). |
 | `GET` | `/api/trades` | Operaciones locales. |
 | `POST` | `/api/trades/sync` | Sincroniza historial MT5. |
 | `GET` | `/api/db/tables*` | Visor de base de datos local. |
@@ -244,6 +306,10 @@ Rutas principales (todas bajo `http://127.0.0.1:8000`):
 | `GET` | `/api/trade/info/{symbol}` | Info del símbolo para operar. |
 | `POST` | `/api/trade/market` | Enviar orden de mercado. |
 | `POST` | `/api/positions/{ticket}/close` | Cerrar posición. |
+| `GET` | `/api/watcher/status` | Config + estado del watcher. |
+| `POST` | `/api/watcher/scan` | Dispara un escaneo manual. |
+| `POST` | `/api/watcher/auto-execute` | Conmuta la auto-ejecución del watcher. |
+| `GET/POST` | `/api/research/*` | Pipeline de research (runs, export, backtest, calibrate, validate, search, apply, audit). |
 
 ---
 
@@ -260,6 +326,19 @@ El módulo `mt5_export.py` gestiona la ruta, parsea el nombre (símbolo, timefra
 
 ---
 
+## Pipeline de research
+
+El proyecto incluye un **pipeline de research offline** (`research/`, separado del runtime): exporta histórico de MT5 a CSV, valida la invariante de no-look-ahead, hace **backtest** de la config vigente (`strategy.yaml` / `store`) y sugiere **calibración** (TTL, mínimo de score, riesgo y pesos de componentes) sin sobreescribir la configuración.
+
+```bash
+python research/run_research.py backtest --symbol EURUSD --timeframe M15 --days 90
+python research/run_research.py calibrate --symbol EURUSD --timeframe M15 --days 90
+```
+
+Documentación completa (comandos, decisiones de simulación, pendientes): **`research/README.md`**. Los resultados se guardan en `research/results/` (gitignored).
+
+---
+
 ## Estructura del proyecto
 
 ```
@@ -270,24 +349,29 @@ botTraiding/
 ├── store.py              # Capa de acceso a SQLite
 ├── strategy.py           # Carga y valida strategy.yaml (fuente de verdad)
 ├── strategy.yaml         # Config de la estrategia (riesgo, símbolos, horarios)
-├── risk_engine.py        # Gestión de riesgo y límites diarios
+├── risk_engine.py        # Setup Score, killzones, R:R, TTL, prop firm (puro)
 ├── watcher.py            # Bot "a la escucha" de opportunities
 ├── mt5_export.py         # Lectura de exportaciones AI Chart Assistant
 ├── mt5_mcp_local.py      # Servidor MCP local de herramientas MT5
 ├── cvd_service.py        # Cálculo de CVD / delta
 ├── patterns_service.py   # Servicio de patrones SMC
 ├── pattern_engine.py     # Motor de detección de patrones SMC
+├── chartism_engine.py    # Patrones chartistas clásicos (canal, triángulo, bandera, dobles, H-C-H)
 ├── cot_service.py        # Informe COT (CFTC)
+├── smr_service.py        # SMR / divergencia DXY (Yahoo Finance)
 ├── ff_calendar.py        # Calendario financiero
+├── market_view.py        # Footprint / heatmap / event bars (sintéticos)
+├── simulator.py          # Simulador de mercado sintético unificado (6E/EURUSD)
+├── mock_feed.py          # Feed sintético determinista para order flow 6E
 ├── index.html            # Página principal
 ├── main.js               # Lógica del frontend
 ├── style.css             # Estilos
-├── tools.js              # Utilidades del frontend
-├── echarts.min.js        # Librería vendada (Apache ECharts)
-├── lightweight-charts.standalone.production.js  # Librería vendada de gráficos
+├── tools.js              # Utilidades del frontend (drawings)
+├── echarts.min.js        # Librería vendada (Apache ECharts v6)
 ├── ILOF_Executor_Pro.mq5 # EA de ejecución (MetaEditor)
+├── research/             # Pipeline offline (backtest + calibración; ver research/README.md)
 ├── requirements.txt      # Dependencias Python
-└── tests/                # Suite de pruebas (pytest + escenarios)
+└── tests/                # Suite de pruebas (pytest + escenarios + fixtures)
 ```
 
 Notas sobre archivos locales **no versionados** (los crea la app en tiempo de ejecución): `trading.db` (SQLite generada al arrancar), `mt5_status.json` (snapshot de estado MT5) y `.env` (tus API keys).
@@ -306,5 +390,8 @@ Notas sobre archivos locales **no versionados** (los crea la app en tiempo de ej
 ## Notas
 
 - El trading requiere que la terminal **MetaTrader 5** esté abierta y con sesión iniciada.
+- Sin MT5 abierto puedes seguir usando: order flow mock (6E), chatbot, patrones/SMC/risk evaluación sobre el simulador sintético y el panel completo de research.
 - Para ver cambios de backend recarga la página con **Ctrl+Shift+R** (evita caché).
+- El **SMR / DXY** y el **calendario económico** necesitan salida a internet (Yahoo Finance / proxy Jina); si fallan, los guards degradan a aviso sin congelar el sistema.
 - Verifica el log del servidor en `server_err.log` ante errores de arranque.
+- Documentos de desarrollo incluidos: `ROADMAP.md` (mejoras M1–M4) y `ANALISIS_PROYECTO.md` (auditoría del código).

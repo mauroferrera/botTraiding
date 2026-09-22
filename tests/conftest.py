@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -118,6 +119,38 @@ def make_cvd_from_candles(candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 def make_flat_cvd(count: int = 20, base_value: float = 0.0) -> List[Dict[str, Any]]:
     """CVD series with zero slope (all values identical)."""
     return [{"time": 1_000_000 + i * 900, "value": base_value} for i in range(count)]
+
+
+# ---------------------------------------------------------------------------
+# Order-flow trades factory
+# ---------------------------------------------------------------------------
+
+def make_trades(
+    count: int = 120,
+    base_price: float = 1.0985,
+    side_bias: Optional[float] = None,
+    size_range: tuple = (4, 7),
+    seed: int = 0,
+) -> List[Dict[str, Any]]:
+    """Generate deterministic order-flow trades [{ts, price, size, side}].
+
+    side_bias = probability of "A" (buy aggressor). When None -> 50/50.
+    `side` comes from a local random.Random(seed): same args -> same sequence.
+    """
+    rng = random.Random(seed)
+    price = base_price
+    trades: List[Dict[str, Any]] = []
+    for i in range(count):
+        side = "A" if rng.random() < (side_bias if side_bias is not None else 0.5) else "B"
+        size = rng.randint(*size_range)
+        price += rng.uniform(-base_price * 0.00004, base_price * 0.00004)
+        trades.append({
+            "ts": 1_700_000_000 + i,
+            "price": round(price, 5),
+            "size": size,
+            "side": side,
+        })
+    return trades
 
 
 def make_rising_cvd(count: int = 20, start: float = -500.0, step: float = 120.0) -> List[Dict[str, Any]]:

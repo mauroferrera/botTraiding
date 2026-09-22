@@ -5,12 +5,14 @@ import numpy as np
 import os
 import re
 import statistics
+import subprocess
+import sys
 import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import databento as db
 import MetaTrader5 as mt5
@@ -23,12 +25,17 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import agent as ag
+import chartism_engine
 import cot_service
 import cvd_service
-import ff_calendar as ff
+import ff_calendar as ff                                                   
+import market_view                                                         
+import mock_feed
 import pattern_engine
 import patterns_service
 import risk_engine
+import simulator
+import smr_service
 import store
 import watcher
 
@@ -46,27 +53,8 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory="."), name="static")
 
-_mt5_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mt5")
-_mt5_lock = threading.Lock()
-
-
-def _mt5_call_sync(fn):
-    with _mt5_lock:
-        if not mt5.initialize():
-            mt5.shutdown()
-            raise RuntimeError(
-                "No hay conexión con MetaTrader 5. "
-                "Asegúrate de que la terminal esté abierta y con sesión iniciada."
-            )
-        try:
-            return fn()
-        finally:
-            mt5.shutdown()
-
-
-def run_mt5(fn):
-    future = _mt5_executor.submit(_mt5_call_sync, fn)
-    return future.result(timeout=30)
+# Usamos el ejecutor centralizado de patterns_service para evitar colisiones
+run_mt5 = patterns_service._mt5_run
 
 
 # ============================================================
@@ -125,6 +113,25 @@ class OrderFlowEngine:
         with self._lock:
             return self.settings_locked()
 
+    def reset(self):
+        """Reinicia el estado del engine a cero (usado en cambios Live <-> Mock)."""
+        with self._lock:
+            self._volumes.clear()
+            self._ema = None
+            self._ema_var = 0.0
+            self.recent_trades.clear()
+            self.cvd_history.clear()
+            self.alerts.clear()
+            self.absorb_bins = {}
+            self.cvd = 0.0
+            self.delta = 0.0
+            self.buy_vol = 0.0
+            self.sell_vol = 0.0
+            self.total_vol = 0.0
+            self.spike_count = 0
+            self.last_price = None
+            self._cvd_bucket = None
+
     def _update_zscore(self, size):
         if self._ema is None:
             self._ema = float(size)
@@ -148,14 +155,13 @@ class OrderFlowEngine:
             return None
         window = trades[-win:]
         prices = [t["price"] for t in window]
-        vols = [t["size"] for t in window]
         net_delta = sum((1 if t["side"] == "A" else -1) * t["size"] for t in window)
-        buy = sum(v for v in vols)
-        sell = sum(v for v in vols)
+        buy = sum(t["size"] for t in window if t["side"] == "A")
+        sell = sum(t["size"] for t in window if t["side"] == "B")
         high = max(prices)
         low = min(prices)
         mid = (high + low) / 2.0
-        total = sum(vols)
+        total = buy + sell
         if mid == 0:
             return None
         range_ratio = (high - low) / mid
@@ -214,6 +220,7 @@ class OrderFlowEngine:
             payload = {
                 "event": "trade",
                 "symbol": OF_SYMBOL,
+                "ts": ts,
                 "price": price,
                 "size": size,
                 "side": "A" if side_str == "A" else "B",
@@ -264,6 +271,12 @@ class OrderFlowEngine:
 engine = OrderFlowEngine()
 
 
+# Simulador de mercado sintético unificado: recibe el MISMO tick que `engine` y
+# agrega velas/footprint/VP/CVD/PDH-PDL para que todas las vistas del dashboard
+# respondan a la misma cinta simulada cuando el modo mock está activo.
+sim = simulator.MarketSimulator(normalize_ts=True)
+
+
 class ConnectionManager:
     def __init__(self):
         self.active: list[WebSocket] = []
@@ -302,7 +315,10 @@ manager = ConnectionManager()
 DB_STATE = {
     "enabled": False,
     "connected": False,
+    "mode": "live",
+    "fixture": None,
     "listener_task": None,
+    "runner_task": None,
     "_client": None,
 }
 _db_lock = threading.Lock()
@@ -310,12 +326,25 @@ _db_lock = threading.Lock()
 _main_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
+def _mock_allowed() -> bool:
+    """El feed sintético se habilita con ORDERFLOW_ALLOW_MOCK=1 (default on)."""
+    return os.getenv("ORDERFLOW_ALLOW_MOCK", "1").lower() in ("1", "true", "yes", "on")
+
+
 def databento_status():
     with _db_lock:
+        enabled = DB_STATE["enabled"]
+        mode = DB_STATE["mode"]
+        fixture = DB_STATE["fixture"]
+        source = "mock" if enabled and mode == "mock" else ("live" if enabled else None)
         return {
-            "enabled": DB_STATE["enabled"],
+            "enabled": enabled,
             "connected": DB_STATE["connected"],
             "symbol": OF_SYMBOL,
+            "source": source,
+            "mode": mode,
+            "fixture": fixture,
+            "mock_available": _mock_allowed(),
         }
 
 
@@ -329,27 +358,102 @@ def _get_client():
         return DB_STATE["_client"]
 
 
-def start_databento():
-    """Marca el feed como habilitado y asegura que la tarea esté corriendo."""
+def _clamp_rate(rate):
+    """Normaliza la velocidad de replay del feed mock (1..200 ticks/s)."""
+    if rate is None:
+        return None
+    try:
+        return max(1.0, min(float(rate), 200.0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_rate(rate):
+    """Parsea de forma segura la velocidad de replay enviada por el cliente."""
+    return _clamp_rate(rate)
+
+
+def _sim_active(symbol: Optional[str] = None) -> bool:
+    """True si el feed sintético (mock 6E) está activo.
+
+    Cuando lo está, las vistas de gráfico (EURUSD) y el canal order flow (6E)
+    deben servirse desde el MarketSimulator y no desde MT5. `symbol` filtra por
+    instrumento unificado (6E / EURUSD).
+    """
     with _db_lock:
-        DB_STATE["enabled"] = True
+        if not DB_STATE["enabled"] or DB_STATE["mode"] != "mock":
+            return False
+    if symbol:
+        s = (symbol or "").upper()
+        if s not in ("6E", "6E.C.0", "EURUSD"):
+            return False
+    return True
+
+
+def _cancel_task(task: Optional[asyncio.Task]):
+    if task is not None and not task.done():
+        task.cancel()
+
+
+def start_databento(mode: str = "live", fixture: Optional[str] = None,
+                    rate: Optional[float] = None):
+    """Marca el feed como habilitado y arranca/relanza la tarea correspondiente.
+
+    - mode="mock": feed sintético (mock_feed.py) sin Databento (resetea el
+      engine y el MarketSimulator para un replay determinista y limpio).
+    - mode="live": listener real de Databento (como el arranque histórico).
+    Cambiar de modo o de fixture cancela la tarea previa.
+    """
+    mode = "mock" if (mode or "").lower() == "mock" else "live"
+    if mode == "mock" and not _mock_allowed():
+        return databento_status()
+    with _db_lock:
+        same = DB_STATE["enabled"] and mode == DB_STATE["mode"] and fixture == DB_STATE["fixture"]
+        if not same:
+            DB_STATE["enabled"] = True
+            DB_STATE["mode"] = mode
+            DB_STATE["fixture"] = fixture if mode == "mock" else None
+            DB_STATE["connected"] = False
         task = DB_STATE["listener_task"]
-    if (task is None or task.done()) and _main_loop is not None:
+        runner = DB_STATE["runner_task"]
+    alive = (task is not None and not task.done()) or (runner is not None and not runner.done())
+    if same and alive:
+        return databento_status()
+    _cancel_task(task)
+    _cancel_task(runner)
+    if not same:
+        engine.reset()
+        sim.reset()
+    if _main_loop is None or _main_loop.is_closed():
+        return databento_status()
+    if mode == "mock":
+        new_task = _main_loop.create_task(mock_listener(fixture, rate=rate))
+        with _db_lock:
+            DB_STATE["runner_task"] = new_task
+            DB_STATE["listener_task"] = None
+    else:
         new_task = _main_loop.create_task(databento_listener())
         with _db_lock:
             DB_STATE["listener_task"] = new_task
+            DB_STATE["runner_task"] = None
+    return databento_status()
 
 
 async def stop_databento():
-    """Corta la conexión a Databento y detiene la reconexión (para no pagar)."""
+    """Corta el feed (Databento o mock) y detiene su reprocesamiento."""
     with _db_lock:
         DB_STATE["enabled"] = False
+        DB_STATE["connected"] = False
         client = DB_STATE["_client"]
+        task = DB_STATE["listener_task"]
+        runner = DB_STATE["runner_task"]
     if client is not None:
         try:
             await asyncio.get_running_loop().run_in_executor(None, client.stop)
         except Exception:
             pass
+    _cancel_task(task)
+    _cancel_task(runner)
     return databento_status()
 
 
@@ -386,13 +490,33 @@ async def databento_listener():
             _set_client(None)
             raise
         except Exception as exc:
-            # [TEMPORAL] Pausado el reintento automático: sin licencia live de
-            # Databento (BentoError) no tiene sentido re-insistir cada 5s y saturar
-            # el log. Se notifica el error una vez y se apaga el estado enable para
-            # que no vuelva a intentarlo él solo (el interruptor lo reactiva en frío).
-            await manager.broadcast({"event": "status", "state": "error", "error": str(exc)})
-            with _db_lock:
-                DB_STATE["enabled"] = False
+            msg = str(exc)
+            if "license" in msg.lower():
+                # Sin licencia live de Databento: no re-insistir con el modo live.
+                # Se notifica una vez y se cae automáticamente al feed sintético
+                # (mock) para que la cinta siga operativa sin tocar el interruptor.
+                await manager.broadcast({
+                    "event": "status",
+                    "state": "error",
+                    "error": f"Live sin licencia Databento, activando feed sintético (mock): {msg}",
+                })
+                if not _mock_allowed():
+                    with _db_lock:
+                        DB_STATE["enabled"] = False
+                else:
+                    with _db_lock:
+                        DB_STATE["enabled"] = True
+                        DB_STATE["mode"] = "mock"
+                        DB_STATE["connected"] = False
+                        DB_STATE["fixture"] = None
+                    new_task = _main_loop.create_task(mock_listener(fixture=None, rate=None))
+                    with _db_lock:
+                        DB_STATE["runner_task"] = new_task
+                        DB_STATE["listener_task"] = None
+            else:
+                await manager.broadcast({"event": "status", "state": "error", "error": msg})
+                with _db_lock:
+                    DB_STATE["enabled"] = False
         finally:
             stop_databento_sync()
             _set_client(None)
@@ -401,6 +525,86 @@ async def databento_listener():
 
     with _db_lock:
         DB_STATE["_client"] = None
+
+
+async def mock_listener(fixture: Optional[str] = None, rate: Optional[float] = None,
+                        loop_fixture: bool = True):
+    """Feed sintético (mock) de 6E: reinyecta trades en el engine y los emite
+    al WS. Nativo async (sin run_coroutine_threadsafe: no hay cliente Databento).
+
+    Fuente según mock_feed.SCENARIOS[fixture]: generador con semilla (regímenes
+    noise/spike/absorption/stress) o replay del .jsonl (fixture_*). Al agotar el
+    fixture lo reinicia para permitir observarlo en caliente desde la UI.
+    """
+    scen = mock_feed.SCENARIOS.get(fixture) if fixture else None
+    if scen is None:
+        fixture, scen = "noise", mock_feed.SCENARIOS["noise"]
+    regime = scen.get("regime") or "noise"
+    if rate is None:
+        rate = 50.0 if regime == "stress" else 20.0
+    batch = 5 if regime == "stress" else 1
+    interval = 1.0 / max(rate, 0.1)
+
+    with _db_lock:
+        DB_STATE["enabled"] = True
+        DB_STATE["connected"] = True
+        DB_STATE["mode"] = "mock"
+        DB_STATE["fixture"] = fixture
+
+    loop = asyncio.get_running_loop()
+    try:
+        await manager.broadcast({"event": "feed", "status": databento_status()})
+        while True:
+            if scen["kind"] == "fixture":
+                source = mock_feed.replay(scen["path"])
+            else:
+                source = mock_feed.gen_stream(
+                    regime=scen["regime"],
+                    count=300,
+                    seed=7,
+                    base_price=1.0985,
+                    price_step=0.00005,
+                )
+            buf: List[dict] = []
+            for t in source:
+                # MISMO ts para engine y sim: buckets de CVD y ventanas de
+                # absorción alineados (antes el engine usaba time.time() y el
+                # sim el ts del fixture -> series CVD divergentes en replay).
+                now = time.time()
+                payload = engine.add_trade(
+                    price=t["price"],
+                    size=t["size"],
+                    side=t["side"],
+                    ts=now,
+                )
+                # Misma cinta -> MarketSimulator (velas/footprint/VP/CVD/SMC).
+                sim.add_tick(
+                    price=t["price"],
+                    size=t["size"],
+                    side=t["side"],
+                    ts=now,
+                )
+                if payload is not None:
+                    buf.append(payload)
+                    if batch <= 1:
+                        await manager.broadcast(payload)
+                if batch > 1 and len(buf) >= batch:
+                    await manager.broadcast({"event": "batch", "trades": buf, "symbol": OF_SYMBOL})
+                    buf = []
+                await asyncio.sleep(interval)
+            if not loop_fixture:
+                break
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        await manager.broadcast({"event": "status", "state": "error", "error": str(exc)})
+    finally:
+        with _db_lock:
+            if DB_STATE["runner_task"] is asyncio.current_task():
+                DB_STATE["connected"] = False
+                DB_STATE["enabled"] = False
+                DB_STATE["runner_task"] = None
+        await manager.broadcast({"event": "feed", "status": databento_status()})
 
 
 def _is_enabled():
@@ -484,23 +688,42 @@ def get_account():
 
 
 def get_price(symbol):
-    si = run_mt5(lambda: mt5.symbol_info(symbol))
+    def _fetch():
+        mt5.symbol_select(symbol, True)
+        return mt5.symbol_info(symbol)
+    si = run_mt5(_fetch)
     if si is None:
         return None
     return {"symbol": si.name, "bid": si.bid, "ask": si.ask, "last": si.last}
 
 
-def build_chart_snapshot(symbol: str = "EURUSD", timeframe: str = "M15") -> dict:
+def build_chart_snapshot(symbol: str = "EURUSD", timeframe: str = "M15",
+                         synthetic: Optional[bool] = None,
+                         for_execution: bool = False) -> dict:
     """Snapshot técnico de la AI Chart Assistant: precio en vivo + PDH/PDL + análisis
-    SMC + exportación del indicador. Usado por el endpoint y por el tool del agente."""
+    SMC + exportación del indicador. Usado por el endpoint y por el tool del agente.
+
+    `synthetic`: fuerza (True) o bloquea (False) el uso del MarketSimulator.
+    Por defecto (None) se activa automáticamente cuando el feed mock 6E está
+    encendido. `for_execution=True` (watcher / auto-ejecución) SIEMPRE usa datos
+    reales de MT5 para no ejecutar órdenes reales sobre cinta sintética.
+    """
     symbol = (symbol or "EURUSD").upper()
     tf = (timeframe or "M15").upper()
 
-    data = patterns_service.get_pattern_data(symbol, tf)
-    if data is None:
-        raise RuntimeError(f"Sin datos de '{symbol}' en Market Watch.")
+    sim_data = False
+    if not for_execution:
+        sim_data = _sim_active(symbol) if synthetic is None else bool(synthetic)
 
-    quote = get_price(symbol)
+    if sim_data:
+        data = sim.patterns(symbol, tf, bars=300)
+        sp = sim.last_price()
+        quote = {"symbol": symbol, "bid": sp, "ask": sp, "last": sp} if sp is not None else None
+    else:
+        data = patterns_service.get_pattern_data(symbol, tf)
+        if data is None:
+            raise RuntimeError(f"Sin datos de '{symbol}' en Market Watch.")
+        quote = get_price(symbol)
 
     export = None
     try:
@@ -544,29 +767,44 @@ def build_chart_snapshot(symbol: str = "EURUSD", timeframe: str = "M15") -> dict
     # CVD: PRIORIDAD live (Databento 6E) vs sintético (tick volume MT5). El
     # selector elige y etiqueta la fuente real para no mentir en el label: la
     # serie live solo gana si hay >= 5 puntos recientes del feed conectado.
-    try:
-        cvd_points = cvd_service.get_cvd(symbol, tf, bars=30)
-    except Exception:
-        cvd_points = None
-    live_cvd = None
-    if bool((databento_status() or {}).get("connected")):
+    # En modo simulador, la serie salida del propio stream sintético (la MISMA
+    # que alimenta el footprint) reemplaza cualquier fuente de MT5.
+    if sim_data:
         try:
-            live_cvd = engine.cvd_series(since=time.time() - 30 * 900)
+            sim_cvd = sim.cvd_series()
         except Exception:
-            live_cvd = None
-    cvd_points, cvd_source, cvd_warning = cvd_service.pick_cvd_source(
-        live_cvd, cvd_points, min_live_points=5
-    )
-    if cvd_points is not None:
-        snap["cvd"] = cvd_points
-        snap["cvd_source"] = cvd_source
-        if cvd_warning:
-            snap["cvd_warning"] = cvd_warning
-        elif cvd_source == "synthetic (tick volume MT5)":
+            sim_cvd = None
+        if sim_cvd:
+            snap["cvd"] = sim_cvd
+            snap["cvd_source"] = "simulated (6E synthetic)"
             snap["cvd_warning"] = (
-                "CVD sintético: acumulado de tick volume de MT5, no volumen real de "
-                "mercado (feed de Databento apagado). Tómese como proxy relativo."
+                "CVD simulado: acumulado del tick stream sintético del feed mock 6E. "
+                "Cambia a modo live para datos reales."
             )
+    else:
+        try:
+            cvd_points = cvd_service.get_cvd(symbol, tf, bars=30)
+        except Exception:
+            cvd_points = None
+        live_cvd = None
+        if bool((databento_status() or {}).get("connected")):
+            try:
+                live_cvd = engine.cvd_series(since=time.time() - 30 * 900)
+            except Exception:
+                live_cvd = None
+        cvd_points, cvd_source, cvd_warning = cvd_service.pick_cvd_source(
+            live_cvd, cvd_points, min_live_points=5
+        )
+        if cvd_points is not None:
+            snap["cvd"] = cvd_points
+            snap["cvd_source"] = cvd_source
+            if cvd_warning:
+                snap["cvd_warning"] = cvd_warning
+            elif cvd_source == "synthetic (tick volume MT5)":
+                snap["cvd_warning"] = (
+                    "CVD sintético: acumulado de tick volume de MT5, no volumen real de "
+                    "mercado (feed de Databento apagado). Tómese como proxy relativo."
+                )
 
     # COT (CFTC): solo para EURUSD (contrato 6E) y solo si hay reporte almacenado.
     cot_report = None
@@ -585,13 +823,29 @@ def build_chart_snapshot(symbol: str = "EURUSD", timeframe: str = "M15") -> dict
         patterns = (data.get("analysis") or {}).get("patterns")
         candle_data = data.get("candles") or []
         cvd_data = snap.get("cvd")
+
+        # Divergencia SMR (DXY): si el feed del dólar cae, evalúa a neutro y el
+        # score no se penaliza (el bono solo suma cuando se confirma).
+        try:
+            smr_data = smr_service.evaluate(
+                symbol, tf, candles=candle_data,
+            ) if ((cfg_r.get("data_sources") or {}).get("smr_dxy", True)) else None
+        except Exception:
+            smr_data = None
+        snap["smr"] = smr_data or {
+            "symbol": symbol, "timeframe": tf, "dxy_available": False,
+            "dxy": {"last_close": None, "candles": 0, "source": "no data"},
+            "bull": {"confirmed": False, "detail": "SMR no disponible (neutro).", "data": None},
+            "bear": {"confirmed": False, "detail": "SMR no disponible (neutro).", "data": None},
+        }
+
         bull = risk_engine.setup_score(
             {"direction": "BUY", "cot": cot_report, "cvd": cvd_data,
-             "patterns": patterns, "candles": candle_data},
+             "patterns": patterns, "candles": candle_data, "smr": smr_data},
             weights=weights, killzones=kz_windows)
         bear = risk_engine.setup_score(
             {"direction": "SELL", "cot": cot_report, "cvd": cvd_data,
-             "patterns": patterns, "candles": candle_data},
+             "patterns": patterns, "candles": candle_data, "smr": smr_data},
             weights=weights, killzones=kz_windows)
         snap["risk_engine"] = {
             "bull": bull,
@@ -728,6 +982,23 @@ def index():
     )
 
 
+def _watcher_news_gate():
+    """Gate de noticias para el pre-chequeo del watcher con la config activa.
+    Si el calendario no responde, fail-open (no bloquea)."""
+    try:
+        cfg = store.get_trading_config() or {}
+        ds = cfg.get("data_sources") or {}
+        if not ds.get("news", True):
+            return {"ok": True, "fail_open": True, "reason": "news desactivado", "event": None}
+        return ff.news_gate(
+            min_impact=cfg.get("news_gate_impact", "red"),
+            buffer_min=float(cfg.get("news_buffer_min") or 15),
+        )
+    except Exception as exc:
+        log.exception("error en news_gate del watcher")
+        return {"ok": True, "fail_open": True, "reason": str(exc), "event": None}
+
+
 @app.on_event("startup")
 async def startup_event():
     global _main_loop, _ALERT_TASK, _WATCHER_TASK
@@ -739,10 +1010,19 @@ async def startup_event():
     # Bot a la escucha (watcher): snapshot desde el pipeline real, emisor de
     # broadcasts por WebSocket y, si auto_execute está activo, ejecutor de órdenes.
     _WATCHER_TASK = asyncio.create_task(watcher.strategy_watcher(
-        snapshot_builder=build_chart_snapshot,
+        # for_execution=True: el watcher (que puede auto-ejecutar órdenes MT5
+        # reales) SIEMPRE se alimenta de datos reales, nunca de la cinta
+        # sintética del simulador.
+        snapshot_builder=lambda sym, tf: build_chart_snapshot(sym, tf, for_execution=True),
         executor=_watcher_execute,
         broadcast=lambda payload: asyncio.create_task(manager.broadcast(payload)),
+        io={"news_gate": _watcher_news_gate},
     ))
+    # Provider de patrones SMC: cuando el feed mock 6E está activo, agente y
+    # bitácora analizan las velas del MarketSimulator (PDH/PDL sintético).
+    patterns_service.register_provider(
+        lambda sym, tf, bars: sim.patterns(sym, tf, bars) if _sim_active(sym) else None
+    )
     try:
         sync_trades()
     except Exception:
@@ -795,17 +1075,34 @@ def api_orderflow_feed_status():
 
 class FeedControl(BaseModel):
     action: str
+    mode: Optional[str] = None
+    fixture: Optional[str] = None
+    rate: Optional[float] = None
 
 
 @app.post("/api/orderflow/feed")
 async def api_orderflow_feed(body: FeedControl):
     action = (body.action or "").replace("feed_", "")
     if action == "start":
-        start_databento()
+        start_databento(mode=body.mode, fixture=body.fixture, rate=_clamp_rate(body.rate))
         return databento_status()
     if action == "stop":
         return await stop_databento()
     return databento_status()
+
+
+@app.get("/api/orderflow/fixtures")
+def api_orderflow_fixtures():
+    scenarios = [
+        {
+            "id": name,
+            "kind": s["kind"],
+            "regime": s.get("regime"),
+            "path": s.get("path"),
+        }
+        for name, s in mock_feed.SCENARIOS.items()
+    ]
+    return {"mode": "mock", "mock_available": _mock_allowed(), "scenarios": scenarios}
 
 
 class OrderFlowSettings(BaseModel):
@@ -834,6 +1131,14 @@ def api_orderflow_cvd(since: Optional[float] = None):
 @app.get("/api/analysis/cvd/{symbol}")
 def api_analysis_cvd(symbol: str, timeframe: str = "M15", bars: int = 300):
     """CVD sintético (tick volume de MT5) para el símbolo/timeframe activo."""
+    if _sim_active(symbol):
+        points = sim.cvd_series()
+        if not points:
+            return JSONResponse(
+                {"error": "Sin datos simulados todavía (arranca el feed mock y espera unos ticks)."},
+                status_code=404,
+            )
+        return points
     try:
         points = cvd_service.get_cvd(symbol, timeframe, bars)
     except ValueError as exc:
@@ -875,7 +1180,8 @@ async def websocket_endpoint(websocket: WebSocket):
                             "settings": updated,
                         })
                     elif action == "feed_start":
-                        start_databento()
+                        start_databento(mode=data.get("mode"), fixture=data.get("fixture"),
+                                        rate=_safe_rate(data.get("rate")))
                         await manager.broadcast({
                             "event": "feed",
                             "status": databento_status(),
@@ -1284,6 +1590,21 @@ def api_chart_setup_eval(symbol: str = "EURUSD", timeframe: str = "M15", min_sco
         view = {"start_time": (last_time - 3600) if last_time else None,
                 "end_time": last_time, "price_min": lo, "price_max": hi}
 
+    # News Blackout: información de la ventana de noticia para la UI (hard gate
+    # real está en execute_market_trade y en el watcher). Fail-open si el
+    # calendario no se puede leer.
+    news_gate_res = {"ok": True, "fail_open": True, "reason": "no evaluado", "event": None}
+    try:
+        news_cfg = (store.get_trading_config().get("data_sources") or {}).get("news", True)
+        if news_cfg:
+            news_gate_res = ff.news_gate(
+                min_impact=store.get_trading_config().get("news_gate_impact", "red"),
+                buffer_min=float(store.get_trading_config().get("news_buffer_min") or 15),
+            )
+    except Exception as exc:
+        news_gate_res = {"ok": True, "fail_open": True, "reason": str(exc), "event": None}
+    news_blackout = bool(news_gate_res and not news_gate_res.get("ok"))
+
     return {
         "symbol": snapshot["symbol"],
         "timeframe": snapshot["timeframe"],
@@ -1296,6 +1617,9 @@ def api_chart_setup_eval(symbol: str = "EURUSD", timeframe: str = "M15", min_sco
         "tp": tp,
         "entry_kind": entry_kind,
         "approved": approved,
+        "news_blackout": news_blackout,
+        "news_gate": news_gate_res.get("event"),
+        "news_reason": news_gate_res.get("reason"),
         "reasons": reasons,
         "echarts": echarts,
         "view": view,
@@ -1423,6 +1747,14 @@ def api_history(days: int = 7):
 
 @app.get("/api/price/{symbol}")
 def api_price(symbol: str):
+    if _sim_active(symbol):
+        sp = sim.last_price()
+        if sp is None:
+            return JSONResponse(
+                {"error": "Simulador sin precio (arranca el feed mock 6E)."},
+                status_code=404,
+            )
+        return {"symbol": symbol.upper(), "bid": sp, "ask": sp, "last": sp}
     data = get_price(symbol.upper())
     if data is None:
         return JSONResponse(
@@ -1456,6 +1788,14 @@ def to_candle(r, tf):
 
 @app.get("/api/candles/{symbol}")
 def api_candles(symbol: str, timeframe: str = "M15", bars: int = 300):
+    if _sim_active(symbol):
+        candles = sim.candles(timeframe, bars)
+        if not candles:
+            return JSONResponse(
+                {"error": "Sin velas de simulador (arranca el feed mock 6E)."},
+                status_code=404,
+            )
+        return candles
     tf = TIMEFRAMES.get(timeframe.upper())
     if tf is None:
         return JSONResponse(
@@ -1480,6 +1820,14 @@ def api_candles(symbol: str, timeframe: str = "M15", bars: int = 300):
 
 @app.get("/api/candle/last/{symbol}")
 def api_candle_last(symbol: str, timeframe: str = "M15"):
+    if _sim_active(symbol):
+        candles = sim.candles(timeframe, 2)
+        if not candles:
+            return JSONResponse(
+                {"error": "Sin velas de simulador (arranca el feed mock 6E)."},
+                status_code=404,
+            )
+        return candles[-1]
     tf = TIMEFRAMES.get(timeframe.upper())
     if tf is None:
         return JSONResponse(
@@ -1504,7 +1852,13 @@ def api_candle_last(symbol: str, timeframe: str = "M15"):
 
 @app.get("/api/analysis/patterns/{symbol}", response_model=None)
 def api_analysis_patterns(symbol: str, timeframe: str = "M15", bars: int = 300):
-    """Zonas SMC activas (FVG / Order Blocks / Liquidity Sweeps) para el frontend."""
+    """Zonas SMC activas (FVG / Order Blocks / Liquidity Sweeps) para el frontend.
+
+    En modo sim (feed mock 6E encendido) se analizan las velas del
+    MarketSimulator contra el PDH/PDL sintético de la sesión simulada."""
+    if _sim_active(symbol):
+        data = sim.patterns(symbol, timeframe, bars)
+        return {**data["analysis"], "pdh": data["pdh"], "pdl": data["pdl"]}
     try:
         data = patterns_service.get_pattern_data(symbol, timeframe, bars)
     except ValueError as exc:
@@ -1517,6 +1871,57 @@ def api_analysis_patterns(symbol: str, timeframe: str = "M15", bars: int = 300):
             status_code=404,
         )
     return {**data["analysis"], "pdh": data["pdh"], "pdl": data["pdl"]}
+
+
+@app.get("/api/analysis/chartism/{symbol}", response_model=None)
+def api_analysis_chartism(symbol: str, timeframe: str = "M15", bars: int = 300,
+                          patterns: str = "all"):
+    """Patrones chartistas clásicos (canales, triángulos, banderas, dobles, H&S).
+
+    La lista `patterns` acepta una lista separada por comas: trend,triangle,flag,
+    double,hns (o 'all'). Devuelve figuras en el mismo formato `drawing` que
+    consume `tools.js` (line/hline/text), listas para el frontend.
+    """
+    try:
+        data = patterns_service.get_pattern_data(symbol, timeframe, bars)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
+    if data is None:
+        return JSONResponse(
+            {"error": f"No hay datos de '{symbol.upper()}' en Market Watch."},
+            status_code=404,
+        )
+
+    req = [p.strip().lower() for p in str(patterns).split(",") if p.strip()]
+    invalid = [p for p in req if p not in chartism_engine.GROUPS and p != "all"]
+    if invalid:
+        return JSONResponse(
+            {"error": f"Patrón(es) no válido(s): {', '.join(invalid)}. "
+                      f"Usa: {', '.join(chartism_engine.GROUPS)} o 'all'."},
+            status_code=400,
+        )
+    if req and req[-1] == "all":
+        req = list(chartism_engine.GROUPS)
+
+    return {
+        "symbol": symbol.upper(),
+        **chartism_engine.detect_all(data["candles"], req, timeframe.upper()),
+    }
+
+
+@app.get("/api/analysis/smr/{symbol}", response_model=None)
+def api_analysis_smr(symbol: str, timeframe: str = "M15"):
+    """Divergencia SMR (DXY) para el símbolo/timeframe: reglas alcista y bajista.
+
+    Fuente del DXY: Yahoo Finance (DX-Y.NYB), gratis. Sin feed, degrada a neutro
+    (confirmed=False) sin romper el dashboard."""
+    try:
+        result = smr_service.evaluate(symbol, timeframe)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return result
 
 
 @app.get("/api/volume-profile/{symbol}", response_model=None)
@@ -1535,6 +1940,13 @@ def api_volume_profile(symbol: str, timeframe: str = "H1", bins: int = 48,
     tf_map = {"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60, "H4": 240, "D1": 1440, "W1": 10080, "MN1": 43200}
     tf = timeframe.upper()
     try:
+        if _sim_active(symbol):
+            res = sim.vp(bins=max(8, min(bins, 200)), poc_pct=poc_pct)
+            if res is None:
+                return JSONResponse(
+                    {"error": "Sin datos de simulador (arranca el feed mock)."}, status_code=404,
+                )
+            return res
         from datetime import datetime, timezone, timedelta
         now = datetime.now(timezone.utc)
         session_start = now - timedelta(minutes=tf_map.get(tf, 60) * 12)  # 12 sesiones hacia atrás como rango
@@ -1566,6 +1978,14 @@ def api_volume_profile(symbol: str, timeframe: str = "H1", bins: int = 48,
                     volumes = np.ones_like(prices)
             else:
                 volumes = np.ones_like(prices)
+            # Lado agresor aproximado: last >= bid -> compra (ask), last <= ask -> venta.
+            names = ticks.dtype.names or []
+            side = None
+            if col == "last" and "bid" in names and "ask" in names:
+                bid = ticks["bid"].astype(float)
+                ask = ticks["ask"].astype(float)
+                side = np.where(ticks[col] >= bid, 1.0,
+                                np.where(ticks[col] <= ask, -1.0, 0.0))
             source = "ticks"
         else:
             # Fallback: copy_rates_from_pos (OHLCV)
@@ -1578,13 +1998,16 @@ def api_volume_profile(symbol: str, timeframe: str = "H1", bins: int = 48,
                 )
             prices = []
             volumes = []
+            side = []
             for r in rates:
                 avg = (r["open"] + r["high"] + r["low"] + r["close"]) / 4.0
                 vol = float(r["tick_volume"])
                 prices.append(avg)
                 volumes.append(vol)
+                side.append(1.0 if r["close"] >= r["open"] else -1.0)
             prices = np.array(prices)
             volumes = np.array(volumes)
+            side = np.array(side)
             source = "bars"
 
         lo = float(prices.min())
@@ -1593,12 +2016,28 @@ def api_volume_profile(symbol: str, timeframe: str = "H1", bins: int = 48,
             return JSONResponse({"error": "Rango de precios insuficiente."}, status_code=400)
         edges = np.linspace(lo, hi, bins + 1)
         bin_vol = np.zeros(bins)
+        bin_bid = np.zeros(bins)
+        bin_ask = np.zeros(bins)
         for i, p in enumerate(prices):
             idx = min(int((p - lo) / (hi - lo) * bins), bins - 1)
-            bin_vol[idx] += float(volumes[i]) if i < len(volumes) else 1.0
+            v = float(volumes[i]) if i < len(volumes) else 1.0
+            bin_vol[idx] += v
+            if side is not None:
+                s = float(side[i])
+                if s > 0:
+                    bin_ask[idx] += v
+                elif s < 0:
+                    bin_bid[idx] += v
+                else:
+                    bin_ask[idx] += v * 0.5
+                    bin_bid[idx] += v * 0.5
+            else:
+                bin_ask[idx] += v * 0.5
+                bin_bid[idx] += v * 0.5
         bin_centers = ((edges[:-1] + edges[1:]) / 2.0).tolist()
-        profile = [{"price": round(float(c), 6), "vol": round(float(v), 2)}
-                    for c, v in zip(bin_centers, bin_vol)]
+        profile = [{"price": round(float(c), 6), "vol": round(float(v), 2),
+                    "delta": round(float(a - b), 2)}
+                   for c, v, a, b in zip(bin_centers, bin_vol, bin_ask, bin_bid)]
 
         # POC, VAH, VAL
         poc_idx = int(np.argmax(bin_vol))
@@ -1633,6 +2072,144 @@ def api_volume_profile(symbol: str, timeframe: str = "H1", bins: int = 48,
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
+def _market_view_candles(symbol: str, timeframe: str, bars: int):
+    """Velas OHLCV via MT5 reutilizando to_candle (misma referencia que el grafico)."""
+    tf = TIMEFRAMES.get(timeframe.upper())
+    if tf is None:
+        raise ValueError(
+            f"Timeframe '{timeframe}' no válido. Usa M1..M30, H1, H4, D1 o W1."
+        )
+
+    def _get():
+        rates = mt5.copy_rates_from_pos(symbol.upper(), tf, 0, max(10, min(bars, 1000)))
+        if rates is None or len(rates) == 0:
+            return None
+        return [to_candle(r, tf) for r in rates.tolist()]
+
+    return run_mt5(_get)
+
+
+_TEST_FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "tests", "fixtures")
+
+
+def _load_test_fixture(filename: str):
+    """Carga un JSON de tests/fixtures/ (datos de control para auditoria visual)."""
+    path = os.path.join(_TEST_FIXTURES_DIR, filename)
+    if not os.path.isfile(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+@app.get("/api/analysis/footprint/{symbol}", response_model=None)
+def api_footprint(symbol: str, timeframe: str = "M15", bars: int = 150,
+                  bid_ratio: float = 0.6, rows: int = 12, mode: str = "live"):
+    """Footprint / cluster chart por barra (modelo sintetico mientras no haya feed real).
+
+    `mode=test` sirve el fixture de test (`tests/fixtures/footprint_extremes.json`)
+    SIN tocar MT5 ni Market Watch: es la via de auditoria visual 1:1 que usa el
+    mismo contrato de datos que la UI, para validar pared/gradiente/ruido."""
+    try:
+        if mode.lower() in ("test", "mock"):
+            return _load_test_fixture("footprint_extremes.json") or JSONResponse(
+                {"error": "Falta tests/fixtures/footprint_extremes.json."}, status_code=404,
+            )
+        if _sim_active(symbol):
+            res = sim.footprint(
+                max_bars=max(10, min(bars, 1000)), rows=max(6, min(rows, 24)),
+            )
+            if res is None:
+                return JSONResponse(
+                    {"error": "Sin datos de simulador (arranca el feed mock)."}, status_code=404,
+                )
+            return res
+        candles = _market_view_candles(symbol, timeframe, bars)
+        if not candles:
+            return JSONResponse(
+                {"error": f"No hay datos de '{symbol.upper()}' en Market Watch."},
+                status_code=404,
+            )
+        return market_view.footprint(
+            candles, max_bars=max(10, min(bars, 1000)),
+            bid_ratio=bid_ratio, rows=max(6, min(rows, 24)),
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/analysis/heatmap/{symbol}", response_model=None)
+def api_liquidity_heatmap(symbol: str, timeframe: str = "M15", bars: int = 150,
+                          levels: int = 64, mode: str = "live"):
+    """Mapa de calor de liquidez (pseudo-DOM) detras del precio (sintetico).
+
+    `mode=test` sirve el fixture de test (`tests/fixtures/heatmap_extremes.json`)
+    SIN tocar MT5 ni Market Watch: es la via de auditoria visual 1:1 que usa el
+    mismo contrato de datos que la UI."""
+    try:
+        if mode.lower() in ("test", "mock"):
+            return _load_test_fixture("heatmap_extremes.json") or JSONResponse(
+                {"error": "Falta tests/fixtures/heatmap_extremes.json."}, status_code=404,
+            )
+        if _sim_active(symbol):
+            res = sim.heatmap(
+                max_bars=max(10, min(bars, 1000)), levels=max(32, min(levels, 128)),
+            )
+            if res is None or not res.get("data"):
+                return JSONResponse(
+                    {"error": "Sin datos de simulador (arranca el feed mock)."}, status_code=404,
+                )
+            return res
+        candles = _market_view_candles(symbol, timeframe, bars)
+        if not candles:
+            return JSONResponse(
+                {"error": f"No hay datos de '{symbol.upper()}' en Market Watch."},
+                status_code=404,
+            )
+        return market_view.liquidity_heatmap(
+            candles, max_bars=max(10, min(bars, 1000)),
+            levels=max(32, min(levels, 128)),
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/analysis/eventbars/{symbol}", response_model=None)
+def api_eventbars(symbol: str, timeframe: str = "M15", bars: int = 200,
+                  mode: str = "volbar", param: int = 500, ticks: int = 160):
+    """Barras por evento (volbar / tickbar / renko) desde OHLCV sintetico.
+
+    `ticks` = ticks sinteticos generados por vela base: con bars=1000 y
+    tickbar/param=500, 160 ticks/vela producen ~320 barras para que el
+    gráfico no quede estirado con pocas velas."""
+    try:
+        if _sim_active(symbol):
+            res = sim.event_bars(bar_type=mode, param=int(param))
+            if res is None:
+                return JSONResponse(
+                    {"error": "Sin datos de simulador (arranca el feed mock)."}, status_code=404,
+                )
+            return res
+        candles = _market_view_candles(symbol, timeframe, bars)
+        if not candles:
+            return JSONResponse(
+                {"error": f"No hay datos de '{symbol.upper()}' en Market Watch."},
+                status_code=404,
+            )
+        return market_view.event_bars(
+            candles, bar_type=mode, param=int(param),
+            ticks_per_candle=max(8, min(ticks, 960)),
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 @app.get("/api/analysis/chart-assistant/{symbol}", response_model=None)
 def api_analysis_chart_assistant(symbol: str, timeframe: str = "M15"):
     """Snapshot de la AI Chart Assistant (precio + SMC + exportación) para el botón del dashboard."""
@@ -1648,8 +2225,14 @@ def api_analysis_chart_assistant(symbol: str, timeframe: str = "M15"):
 async def stream_generator(symbol, tf):
     while True:
         try:
-            candle = get_last_candle(symbol, tf)
-            quote = get_price(symbol)
+            if _sim_active(symbol):
+                candles = sim.candles("M15", 2)
+                candle = candles[-1] if candles else None
+                sp = sim.last_price()
+                quote = {"symbol": symbol.upper(), "bid": sp, "ask": sp, "last": sp} if sp is not None else None
+            else:
+                candle = get_last_candle(symbol, tf)
+                quote = get_price(symbol)
             message = {
                 "type": "candle",
                 "symbol": symbol.upper(),
@@ -2752,9 +3335,25 @@ def execute_market_trade(symbol, action, volume=None, sl_pips=None, tp_pips=None
         except Exception as exc:
             gate = {"ok": True, "fail_open": True, "reason": str(exc), "event": None}
         if not gate.get("ok"):
+            try:
+                store.log_setup({
+                    "symbol": symbol, "timeframe": patterns_service.DEFAULT_TIMEFRAME,
+                    "direction": (action or "BUY").upper(), "verdict": "IGNORED_NEWS",
+                    "score": 0.0, "breakdown": {},
+                    "entry": None, "sl": None, "target": None,
+                    "invalidate_level": None, "validated": False,
+                    "reject_reasons": [
+                        "BLOCKED_BY_NEWS_GATE: " + str(gate.get("reason"))
+                    ],
+                    "risk_state": {}, "trade_result": {},
+                })
+            except Exception:
+                pass
             return {
                 "error": "Operar bloqueado por calendario económico: "
-                + str(gate.get("reason"))
+                + str(gate.get("reason")),
+                "status": "BLOCKED_BY_NEWS_GATE",
+                "news": gate.get("event"),
             }, 403
 
     if sl_pips is None:
@@ -2867,6 +3466,406 @@ def api_position_close(ticket: int):
     except Exception:
         pass
     return {**result, "risk": daily_risk_state()}
+
+
+# ============================================================
+# Research / Backtest (pipeline offline research/)
+# ============================================================
+# El pipeline vive en research/ y es deliberadamente ajeno al runtime
+# (research/__init__.py: app/agent/watcher no importan nada de ahí). Por eso
+# aquí se ejecuta como SUBPROCESO del mismo CLI (research/run_research.py):
+# se respeta la separación, se reutiliza el mismo código y los resultados
+# quedan en research/results compartidos con la consola.
+
+_RESEARCH_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "research")
+_RESEARCH_RESULTS = os.path.join(_RESEARCH_DIR, "results")
+_RESEARCH_CLI = os.path.join("research", "run_research.py")
+
+
+class ResearchRunBody(BaseModel):
+    symbol: str = "EURUSD"
+    timeframe: str = "M15"
+    days: int = 90
+
+
+def _research_subprocess(args, timeout=900):
+    code = subprocess.run(
+        [sys.executable, _RESEARCH_CLI, *args],
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
+    return code.returncode == 0, (code.stdout or ""), (code.stderr or "")
+
+
+def _research_payload_path(symbol, timeframe, kind):
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return os.path.join(_RESEARCH_RESULTS, f"{symbol}_{timeframe}_{day}_{kind}.json")
+
+
+def _research_load_payload(symbol, timeframe, kind):
+    path = _research_payload_path(symbol, timeframe, kind)
+    if not os.path.exists(path):
+        return None, f"No hay resultado '{kind}' de {symbol} {timeframe} en {path} (ejecuta antes)."
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh), None
+
+
+@app.get("/api/research/runs", response_model=None)
+def api_research_runs(kind: str = ""):
+    """Lista los JSON de research/results (compartidos con el CLI)."""
+    runs = []
+    if os.path.isdir(_RESEARCH_RESULTS):
+        for name in sorted(os.listdir(_RESEARCH_RESULTS), reverse=True):
+            if not name.endswith(".json"):
+                continue
+            info = {"name": name, "kind": None, "mtime": None, "size": None}
+            for k_ in ("bt", "cal", "val", "search"):
+                if name.endswith(f"_{k_}.json"):
+                    info["kind"] = k_
+                    break
+            if kind and info["kind"] != kind:
+                continue
+            p = os.path.join(_RESEARCH_RESULTS, name)
+            try:
+                st = os.stat(p)
+                info["mtime"] = st.st_mtime
+                info["size"] = st.st_size
+            except OSError:
+                pass
+            runs.append(info)
+    return {"runs": runs}
+
+
+@app.post("/api/research/export", response_model=None)
+def api_research_export(body: ResearchRunBody):
+    """Exporta (o refresca) el histórico desde MT5 a research/data/. Necesita terminal abierta."""
+    ok, out, err = _research_subprocess([
+        "export", "--symbol", (body.symbol or "EURUSD").upper(),
+        "--timeframe", (body.timeframe or "M15").upper(), "--days", str(max(1, int(body.days))),
+    ])
+    if not ok:
+        return JSONResponse(
+            {"error": (err or out or "falló el export. ¿Terminal MT5 abierta y con sesión?").strip()},
+            status_code=500,
+        )
+    return {"ok": True, "stdout": out}
+
+
+@app.post("/api/research/backtest", response_model=None)
+def api_research_backtest(body: ResearchRunBody):
+    symbol = (body.symbol or "EURUSD").upper()
+    timeframe = (body.timeframe or "M15").upper()
+    ok, out, err = _research_subprocess([
+        "backtest", "--symbol", symbol, "--timeframe", timeframe,
+        "--days", str(max(1, int(body.days))),
+    ])
+    if not ok:
+        return JSONResponse({"error": (err or out or "falló el backtest").strip()}, status_code=500)
+    payload, perr = _research_load_payload(symbol, timeframe, "bt")
+    if perr:
+        return JSONResponse({"error": perr, "stdout": out}, status_code=500)
+    payload["saved"] = _research_payload_path(symbol, timeframe, "bt")
+    return payload
+
+
+@app.post("/api/research/calibrate", response_model=None)
+def api_research_calibrate(body: ResearchRunBody):
+    symbol = (body.symbol or "EURUSD").upper()
+    timeframe = (body.timeframe or "M15").upper()
+    ok, out, err = _research_subprocess([
+        "calibrate", "--symbol", symbol, "--timeframe", timeframe,
+        "--days", str(max(1, int(body.days))),
+    ])
+    if not ok:
+        return JSONResponse({"error": (err or out or "falló calibrate").strip()}, status_code=500)
+    payload, perr = _research_load_payload(symbol, timeframe, "cal")
+    if perr:
+        return JSONResponse({"error": perr, "stdout": out}, status_code=500)
+    payload["saved"] = _research_payload_path(symbol, timeframe, "cal")
+    return payload
+
+
+@app.post("/api/research/validate", response_model=None)
+def api_research_validate(body: ResearchRunBody):
+    symbol = (body.symbol or "EURUSD").upper()
+    timeframe = (body.timeframe or "M15").upper()
+    ok, out, err = _research_subprocess([
+        "validate", "--symbol", symbol, "--timeframe", timeframe,
+        "--days", str(max(1, int(body.days))),
+    ])
+    if not ok:
+        return JSONResponse({"error": (err or out or "validación con fallos").strip()}, status_code=500)
+    payload, perr = _research_load_payload(symbol, timeframe, "val")
+    if perr:
+        return JSONResponse({"error": perr, "stdout": out}, status_code=500)
+    payload["saved"] = _research_payload_path(symbol, timeframe, "val")
+    return payload
+
+
+class ResearchSearchBody(ResearchRunBody):
+    grid: Optional[str] = None
+    top: int = 5
+    min_filled: int = 10
+
+
+@app.post("/api/research/search", response_model=None)
+def api_research_search(body: ResearchSearchBody):
+    """Grid search Top-N. Solo calcula y reporta; NO escribe stratégia."""
+    symbol = (body.symbol or "EURUSD").upper()
+    timeframe = (body.timeframe or "M15").upper()
+    args = [
+        "search", "--symbol", symbol, "--timeframe", timeframe,
+        "--days", str(max(1, int(body.days))),
+        "--top", str(max(1, int(body.top))),
+        "--min-filled", str(max(1, int(body.min_filled))),
+    ]
+    if body.grid:
+        args += ["--grid", body.grid]
+    ok, out, err = _research_subprocess(args, timeout=1200)
+    if not ok:
+        return JSONResponse({"error": (err or out or "grid search con fallos").strip()},
+                            status_code=500)
+    payload, perr = _research_load_payload(symbol, timeframe, "search")
+    if perr:
+        return JSONResponse({"error": perr, "stdout": out}, status_code=500)
+    payload["saved"] = _research_payload_path(symbol, timeframe, "search")
+    return payload
+
+
+# ============================================================
+# Fase 2: aplicar sugerencias (con backup y re-backtest)
+# ============================================================
+
+_APPLY_ALLOWED = {
+    "min_score", "min_rr", "setup_ttl_minutes", "risk_weights",
+    "sl_default_pips", "tp_ratio_r", "risk_pct", "reduced_risk_pct",
+    "max_trades_day", "loss_limit_fixed", "loss_limit_pct",
+}
+
+_BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")
+
+
+class ResearchApplyItem(BaseModel):
+    key: str
+    value: Any
+
+
+class ResearchApplyBody(BaseModel):
+    updates: list
+    backup: bool = True
+    symbol: str = "EURUSD"
+    timeframe: str = "M15"
+    days: int = 90
+
+
+@app.post("/api/research/apply", response_model=None)
+def api_research_apply(body: ResearchApplyBody):
+    """Aplica manualmente un diff de parámetros a strategy.yaml CON backup previo.
+
+    Exige confirmación del usuario desde la UI (aquí solo se ejecuta lo que le
+    llega ya aprobado). Valida whitelist, copia strategy.yaml a backups/, aplica
+    via store.store.set_trading_config y re-corre el backtest para mostrar el
+    antes/después.
+    """
+    updates: Dict[str, Any] = {}
+    skipped = []
+    for item in body.updates or []:
+        key = str(item.get("key") or "").strip()
+        if key not in _APPLY_ALLOWED:
+            skipped.append({"key": key, "reason": "clave no permitida"})
+            continue
+        value = item.get("value")
+        if key == "risk_weights" and not isinstance(value, dict):
+            skipped.append({"key": key, "reason": "risk_weights debe ser dict"})
+            continue
+        if isinstance(value, (bool, type(None))):
+            skipped.append({"key": key, "reason": f"tipo no válido: {type(value).__name__}"})
+            continue
+        try:
+            if key != "risk_weights":
+                value = float(value)
+        except (TypeError, ValueError):
+            skipped.append({"key": key, "reason": f"valor no numérico: {value!r}"})
+            continue
+        updates[key] = value
+    if not updates:
+        return JSONResponse({"error": "No hay cambios válidos para aplicar.", "skipped": skipped},
+                            status_code=400)
+
+    import strategy as _strategy  # noqa: PLC0415 - acceso al path del YAML
+
+    before_config = {k: store.get_trading_config().get(k) for k in updates}
+
+    os.makedirs(_BACKUP_DIR, exist_ok=True)
+    backup_path = None
+    if body.backup:
+        try:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            backup_path = os.path.join(_BACKUP_DIR, f"strategy-{stamp}.yaml")
+            with open(_strategy.STRATEGY_PATH, "r", encoding="utf-8") as fh_src:
+                with open(backup_path, "w", encoding="utf-8") as fh_dst:
+                    fh_dst.write(fh_src.read())
+        except OSError as exc:
+            return JSONResponse({"error": f"No pude hacer backup de strategy.yaml: {exc}"},
+                                status_code=500)
+
+    try:
+        store.set_trading_config(updates)
+    except Exception as exc:
+        return JSONResponse({"error": f"Fallo al escribir strategy.yaml: {exc}"}, status_code=500)
+
+    after_config = {k: store.get_trading_config().get(k) for k in updates}
+
+    # Re-corre el backtest con la config NUEVA (mismo dataset) para el antes/después.
+    symbol = (body.symbol or "EURUSD").upper()
+    timeframe = (body.timeframe or "M15").upper()
+    ok, out, err = _research_subprocess([
+        "backtest", "--symbol", symbol, "--timeframe", timeframe,
+        "--days", str(max(1, int(body.days))),
+    ])
+    if not ok:
+        return {
+            "ok": True, "applied": updates, "skipped": skipped,
+            "backup_path": backup_path, "before_config": before_config,
+            "after_config": after_config,
+            "warning": "Config aplicada, pero el re-backtest falló: " + (err or out),
+        }
+    payload, perr = _research_load_payload(symbol, timeframe, "bt")
+    if perr:
+        payload = None
+    return {
+        "ok": True,
+        "applied": updates,
+        "skipped": skipped,
+        "backup_path": backup_path,
+        "before_config": before_config,
+        "after_config": after_config,
+        "after_payload": payload,
+        "saved": _research_payload_path(symbol, timeframe, "bt"),
+    }
+
+
+# ============================================================
+# Fase 4: audit de un trade simulado en el gráfico
+# ============================================================
+
+
+class ResearchAuditBody(BaseModel):
+    saved: str
+    signal_ts: float
+    window_before: int = 90
+    window_after: int = 60
+
+
+@app.post("/api/research/audit", response_model=None)
+def api_research_audit(body: ResearchAuditBody):
+    """Reconstruye la instantánea exacta de un trade simulado para auditarlo.
+
+    Usa el MISMO cfg del run guardado (payload JSON) y el dataset de
+    research/data: el sim es determinista e invariante al look-ahead, así que la
+    zona del patrón que gatilló `entry_kind` cuadra con la decisión original.
+    Devuelve las velas alrededor de signal_ts + la caja del patrón + el plan.
+    """
+    name = os.path.basename(body.saved or "").replace("\\", "/")
+    parts = name.rsplit("_", 3)  # SYM_TF_AAAAMMDD_kind.json
+    if len(parts) != 4 or not name.endswith(".json"):
+        return JSONResponse({"error": f"Nombre de run inválido: {body.saved}"}, status_code=400)
+    symbol, timeframe, day, kind = parts
+    run_path = os.path.join(_RESEARCH_RESULTS, name)
+    if not os.path.exists(run_path):
+        return JSONResponse({"error": f"No encuentro {name} en research/results."}, status_code=404)
+    try:
+        with open(run_path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        return JSONResponse({"error": f"No leo el run: {exc}"}, status_code=500)
+
+    run = payload.get("run") or {}
+    cfg = dict(run.get("cfg") or {})
+    trades = run.get("trades") or []
+    signal_ts = int(body.signal_ts)
+    trade = next((t for t in trades if int(t.get("signal_ts") or 0) == signal_ts), None)
+    if trade is None:
+        return JSONResponse({"error": f"No hay trade con signal_ts {signal_ts} en {name}."},
+                            status_code=404)
+
+    try:
+        from research import data as _rdata  # noqa: PLC0415
+        from research import sim as _rsim  # noqa: PLC0415
+    except Exception as exc:  # pragma: no cover - defensivo
+        return JSONResponse({"error": f"Fallo al importar research: {exc}"}, status_code=500)
+
+    ds = _rdata.load_dataset(symbol, timeframe, days=None)
+    if ds is None or not ds["candles"]:
+        return JSONResponse({"error": f"Sin dataset de {symbol} {timeframe} en research/data."},
+                            status_code=500)
+    candles = ds["candles"]
+    times = [int(c["time"]) for c in candles]
+
+    import bisect  # noqa: PLC0415
+    i = bisect.bisect_right(times, signal_ts) - 1  # vela <= signal_ts
+    if i < 0:
+        return JSONResponse({"error": "signal_ts fuera del dataset."}, status_code=404)
+
+    lookback = max(1, int(cfg.get("lookback") or 300))
+    window = candles[max(0, i - lookback + 1): i + 1]
+    close = float(candles[i]["close"])
+    snap = _rsim.replicate_snapshot(window, close, cfg, int(candles[i]["time"]))
+    patterns = (snap.get("analysis") or {}).get("patterns") or {}
+
+    entry_kind = trade.get("entry_kind") or ""
+    zone = None
+    candidates = []
+    for z in (patterns.get("fvgs") or []) + (patterns.get("order_blocks") or []):
+        if z.get("type") == entry_kind and int(z.get("start_time") or 0) <= signal_ts:
+            candidates.append(z)
+    if candidates:
+        live = [z for z in candidates if not z.get("mitigated")]
+        best = live or candidates
+        zone = max(best, key=lambda z: int(z.get("start_time") or 0))
+
+    wb = max(5, int(body.window_before))
+    wa = max(5, int(body.window_after))
+    lo_idx = max(0, i - wb)
+    hi_idx = min(len(candles), i + wa + 1)
+    view = [{
+        "time": int(c["time"]),
+        "open": float(c["open"]), "high": float(c["high"]),
+        "low": float(c["low"]), "close": float(c["close"]),
+        "volume": float(c.get("volume") or 0.0),
+    } for c in candles[lo_idx:hi_idx]]
+
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "run": name,
+        "signal_ts": signal_ts,
+        "tf_sec": run.get("tf_sec"),
+        "zone": zone,
+        "candles": view,
+        "trade": {
+            "id": trade.get("id"),
+            "direction": trade.get("direction"),
+            "score": trade.get("score"),
+            "verdict": trade.get("verdict"),
+            "killzone": trade.get("killzone"),
+            "entry_kind": trade.get("entry_kind"),
+            "status": trade.get("status"),
+            "exit_reason": trade.get("exit_reason"),
+            "plan": trade.get("plan"),
+            "entry_price": trade.get("entry_price"),
+            "exit_price": trade.get("exit_price"),
+            "fill_ts": trade.get("fill_ts"),
+            "exit_ts": trade.get("exit_ts"),
+            "bars_pending": trade.get("bars_pending"),
+            "bars_held": trade.get("bars_held"),
+            "pnl_r": trade.get("pnl_r"),
+        },
+    }
 
 
 if __name__ == "__main__":
